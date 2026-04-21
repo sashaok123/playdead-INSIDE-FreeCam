@@ -1,9 +1,7 @@
 # playdead-INSIDE-FreeCam
 
-![INSIDE](inside_header.jpg)
-
 Free camera mod for **Playdead's INSIDE** made as a Cheat Engine table. Rotate the camera any way you want, fly anywhere in the level, freeze time, explore the whole environment. No game files are modified, everything is runtime patching in memory.
-
+![INSIDE](inside_header.jpg)
 ---
 
 ## For players (short version)
