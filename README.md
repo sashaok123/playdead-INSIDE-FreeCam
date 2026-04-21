@@ -1,298 +1,244 @@
 # playdead-INSIDE-FreeCam
 
-A Cheat Engine table that adds a **true 360° free camera** to Playdead's **INSIDE** (2016, Unity 5.0.4, x64 Mono build). Camera position and orientation are fully user-controlled, **view-relative** movement is implemented through Unity's native `Transform.Translate` and `Transform.Rotate` APIs, and game camera scripts are neutralised via targeted JIT NOP-patches so your rotation and position are never overwritten by the game. Works with keyboard + mouse and Xbox-compatible gamepads.
+![INSIDE](inside_header.jpg)
 
-![INSIDE](https://upload.wikimedia.org/wikipedia/en/thumb/5/58/INSIDE_Cover_Art.jpg/220px-INSIDE_Cover_Art.jpg)
-
----
-
-## Table of contents
-
-- [What this does](#what-this-does)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Controls](#controls)
-- [Quick reference card](#quick-reference-card)
-- [Technical overview](#technical-overview)
-- [How it works (deep dive)](#how-it-works-deep-dive)
-  - [1. cam struct NOP patches](#1-cam-struct-nop-patches-camerablendprobeupdateweightsposition)
-  - [2. JIT NOP of `set_rotation` for 360° rotation](#2-jit-nop-of-set_rotation-for-360-rotation)
-  - [3. JIT NOP of `set_position` for view-relative Translate](#3-jit-nop-of-set_position-for-view-relative-translate)
-  - [4. Gamepad global listener entry](#4-gamepad-global-listener-entry-lb--freecam-rb--slow-mo)
-  - [5. Auto-attach and auto-activate](#5-auto-attach-and-auto-activate)
-- [Known limitations](#known-limitations)
-- [Roadmap / deferred work](#roadmap--deferred-work)
-- [Extending / modifying the table](#extending--modifying-the-table)
-- [Troubleshooting](#troubleshooting)
-- [Credits](#credits)
-- [License](#license)
+Free camera mod for **Playdead's INSIDE** made as a Cheat Engine table. Rotate the camera any way you want, fly anywhere in the level, freeze time, explore the whole environment. No game files are modified, everything is runtime patching in memory.
 
 ---
 
-## What this does
+## For players (short version)
 
-INSIDE ships with a hard-coded orbit camera that tracks the Boy along a fixed axis. This table gives you a genuine flying camera:
+### What it does
 
-- **Real 360° yaw rotation** - look behind the scene, spin around the player, view locations from any angle
-- **View-relative movement** - WASD / left-stick-analog / triggers always move the camera along its own facing direction, regardless of how you have rotated it
-- **Slow-motion pause** - `` `~ `` or RB freezes the Boy at `timeScale = 0.001` while the camera stays fully responsive (possible because our camera writes bypass Unity's Update/deltaTime pipeline)
-- **Gamepad parity with keyboard** - `LB` is identical to `F1`, `RB` is identical to `` `~ ``, everything else mapped sensibly on an Xbox-layout controller
-- **Crash-resistant** - auto-releases NOPs on level transitions (so Unity streaming works), re-resolves stale `Transform` pointers, pcall-wraps every Mono invoke
-- **Cross-session resilient** - if Cheat Engine is closed without deactivating the table first (leaving NOPs in game memory), the next run of the table detects the leftover NOP pattern and continues working instead of bailing out
+The normal camera in INSIDE always stays with the Boy, pointed at him from the side. This mod lets you:
 
-No Boy controls are touched - the left thumbstick, jump, grab, etc. all work exactly as the game intends.
+- rotate the camera a full 360 degrees (look behind, from above, from the front)
+- fly the camera anywhere in the level
+- freeze time so you can study a moment and move the camera freely while the Boy stands still
+- play with either keyboard + mouse or any Xbox-compatible controller
 
-## Requirements
+Boy's own controls are not touched. You still play the game normally while you move the camera.
 
-| | |
-|---|---|
-| Game | **INSIDE** (Steam / GOG), Playdead, 2016 |
-| Game binary | `INSIDE.exe`, x64, built with Unity 5.0.4 + Mono 2.0 |
-| Cheat Engine | **7.5 or newer** |
-| OS | Windows 10 / 11 |
-| Input | Keyboard + mouse or any Xbox-compatible controller (XInput) |
+### How to install
 
-Tested on Steam's retail release. The table makes no changes to game files - all patching is in-memory via Cheat Engine.
-
-## Installation
-
-1. Install [Cheat Engine 7.5+](https://www.cheatengine.org/downloads.php) (official release, not a fork).
+1. Install [Cheat Engine 7.5 or newer](https://www.cheatengine.org/downloads.php) (get it from the official site, not a fork).
 2. Download `INSIDE_Gamepad_FreeCam.CT` from the [latest release](https://github.com/sashaok123/playdead-INSIDE-FreeCam/releases/latest).
-3. Launch INSIDE. Wait for the main menu, then start or load a game and **reach an actual in-level screen** (not main menu, not loading - Unity must have JIT-compiled `CameraBlendProbe` and `CameraScript`).
-4. Double-click `INSIDE_Gamepad_FreeCam.CT`. Cheat Engine will open with the table loaded and auto-attach to the running `INSIDE` process (no need to pick the process manually).
-5. On first open, Cheat Engine will warn about running a Lua script from a table - click **Yes / Run**. This is required to auto-activate the gamepad listener entry.
-6. The status bar should show `[Gamepad Listener] running (LB=FreeCam, RB=Pause)` in the Lua console. You are ready.
+3. Start INSIDE and load into an actual level (not the main menu).
+4. Double-click the `.CT` file. Cheat Engine opens, attaches to the game by itself, and asks once whether to run the Lua script inside the table. Say **Yes**.
+5. You are ready. Press `F1` on keyboard or `LB` on the controller to toggle the FreeCam.
 
-If Cheat Engine does not auto-attach, open `Process List` (the top-left computer icon), pick `INSIDE.exe`, then proceed.
+### Controls
 
-## Controls
+#### Keyboard and mouse
 
-### Keyboard + mouse
-
-| Input | Action |
+| Key | What it does |
 |---|---|
-| **F1** | Toggle FreeCam on / off |
-| **`` `~ ``** (tilde) | Toggle slow-mo pause (`timeScale = 0.001`) |
-| **RMB + mouse** | Aim-pan while held (legacy 2D aim-point move; largely redundant once rotation is available, kept as a quick-look tool) |
-| **Arrow keys** | Aim-pan (legacy) |
-| **W / S** | Move camera forward / back, view-relative |
-| **A / D** | Strafe left / right, view-relative |
-| **Q / E** | Fly down / up, world-vertical |
-| **HOLD R** | Track Boy - releases NOP patches so the game updates camera position toward the Boy; release to re-freeze |
-| **Shift** | x3 speed modifier |
-| **Ctrl** | x5 speed modifier |
-| **Shift + Ctrl** | x15 speed (for crossing entire levels quickly) |
+| F1 | Turn FreeCam on / off |
+| `` `~ `` (tilde, left of 1) | Toggle slow-motion pause |
+| W / S | Move camera forward / back (along the direction you are looking) |
+| A / D | Strafe camera left / right |
+| Q / E | Fly camera down / up |
+| Hold RMB + move mouse | Old-style aim pan (mostly replaced by the gamepad D-Pad rotation) |
+| Hold R | Pull camera back to the Boy while held |
+| Shift | 3x faster |
+| Ctrl | 5x faster |
+| Shift + Ctrl | 15x faster (fly across whole levels) |
 
-### Gamepad (Xbox / XInput)
+#### Xbox controller
 
-| Input | Action |
+| Button | What it does |
 |---|---|
-| **Left Stick** | Boy movement - NOT touched by FreeCam |
-| **Right Stick X** | Strafe left / right (view-relative) |
-| **Right Stick Y** | Fly down / up (world-vertical) |
-| **D-Pad L / R** | 360° yaw rotation (horizontal only, no head tilt) |
-| **D-Pad U / D** | Fly up / down (alt) |
-| **LT / RT** | Move back / forward (view-relative) |
-| **LB** | Toggle FreeCam on / off (same as F1) |
-| **RB** | Toggle slow-mo pause (same as `` `~ ``) |
-| **HOLD Y** | Track Boy (same as HOLD R on keyboard) |
-| **A / B / X** | Unused / game-controlled (typically jump, grab, interact) |
+| Left Stick | Boy moves (the game controls this, FreeCam stays out of the way) |
+| Right Stick X | Strafe camera left / right |
+| Right Stick Y | Fly camera down / up |
+| D-Pad Left / Right | Rotate camera (full 360 degrees, no tilt) |
+| D-Pad Up / Down | Fly up / down |
+| LT / RT | Move camera back / forward |
+| LB | Toggle FreeCam on / off (same as F1) |
+| RB | Toggle slow-motion (same as tilde) |
+| Hold Y | Pull camera back to the Boy |
 
-The **Gamepad Listener** is a background entry kept enabled at all times. It polls the controller at 50 ms intervals and toggles the FreeCam / Time Pause entries on LB / RB edge events. Works even when FreeCam itself is off - so LB genuinely flips the camera on and off, not just turns it off.
+### Tips
 
-## Quick reference card
+- Start FreeCam only when you are in a real level, not in the main menu or a loading screen. The game has to be running for a few seconds before everything is ready.
+- If something goes wrong, just turn the table off in Cheat Engine. Camera goes back to normal. Nothing is broken in the save file.
+- Slow-motion uses `timeScale = 0.001`, so the Boy moves about 1000 times slower. Practically frozen, but the game is still running which matters for some moments.
 
-```
-  ┌─────────────── KEYBOARD ───────────────┐   ┌─────────────── GAMEPAD ───────────────┐
-  │  F1        toggle FreeCam               │   │  LB        toggle FreeCam             │
-  │  ` (tilde) toggle slow-mo pause         │   │  RB        toggle slow-mo pause       │
-  │                                         │   │                                       │
-  │  W / S     forward / back   (view-rel)  │   │  RStick X  strafe L / R   (view-rel)  │
-  │  A / D     strafe  L / R    (view-rel)  │   │  RStick Y  fly down / up  (world Y)   │
-  │  Q / E     fly down / up    (world Y)   │   │  DPad L/R  yaw rotation 360°          │
-  │  RMB+mouse aim-pan (2D legacy)          │   │  DPad U/D  fly up / down  (alt)       │
-  │                                         │   │  LT / RT   back / forward (view-rel)  │
-  │  Shift     x3 speed                     │   │  Y (hold)  track Boy                  │
-  │  Ctrl      x5 speed                     │   │  LStick    Boy (untouched)            │
-  │  R (hold)  track Boy                    │   └───────────────────────────────────────┘
-  └─────────────────────────────────────────┘
-```
+### Troubleshooting quick
 
-## Technical overview
+- **"Library Injection failed" or "cannot resolve CameraBlendProbe..."**: game is still in main menu or loading. Wait for an actual level, try again.
+- **Camera does not rotate with D-Pad, only shifts sideways**: the rotation patch did not apply. See the technical troubleshooting in [architecture.md](architecture.md).
+- **LB / RB do nothing**: the background listener entry is not active. Open the table, find the entry called "Gamepad toggle listener", tick its checkbox.
+- **Camera stays frozen even after I turn the table off**: close Cheat Engine, reopen, reopen the table, turn FreeCam on then off once. The NOP restore will run and put the camera system back.
 
-INSIDE's camera is driven by a chain of Unity MonoBehaviours in `Assembly-CSharp-firstpass.dll`:
+---
+
+## For modders and developers (full technical detail)
+
+Below is the full technical writeup. If you just want to use the mod, you can stop reading here.
+
+### What the table does at a high level
+
+The camera in INSIDE is driven by a chain of Unity MonoBehaviours in `Assembly-CSharp-firstpass.dll`:
 
 ```
-CameraBlendProbe.UpdateWeightsPosition()   // per-fixed-update, writes cameraPosition / aimPosition in the probe struct
-        ↓
-CameraScript.FixedUpdateCamera()           // reads probe, lerps blend state
-        ↓
-CameraScript.MoveCamera()                  // per-frame, writes Camera.main.transform.position + .rotation
-        ↓
+CameraBlendProbe.UpdateWeightsPosition()     // writes probe cameraPosition / aimPosition
+          |
+          v
+CameraScript.FixedUpdateCamera()              // reads probe, lerps into blend state
+          |
+          v
+CameraScript.MoveCamera()                     // writes Camera.main.transform.position + rotation
+          |
+          v
 Unity renders the frame
 ```
 
-To take control of the camera we need to:
+The table does three kinds of patches:
 
-1. **Stop the probe from overwriting the position fields** we want to hold steady (`cam+0xF8 / 0xFC / 0x100`). → NOP three write instructions inside `CameraBlendProbe.UpdateWeightsPosition`.
-2. **Stop `CameraScript.MoveCamera` from overwriting `transform.rotation`** after we have rotated via `Transform.Rotate`. → NOP the specific `call [set_rotation]` instruction inside the JIT-compiled body.
-3. **Stop `CameraScript.MoveCamera` from overwriting `transform.position`** after we have translated via `Transform.Translate`. → NOP the specific `call [set_position]` instruction in the same method.
-4. **Drive the camera** via Mono reflection, calling Unity's own `Transform.Rotate(x, y, z)` and `Transform.Translate(x, y, z)` with three primitive `single` arguments (note: Vector3-argument overloads do NOT marshal correctly through Cheat Engine's Lua - we had to enumerate all overloads and pick the 3-float one).
+1. **Three bytes-level NOPs** inside `CameraBlendProbe.UpdateWeightsPosition` to stop the probe from regenerating its state every fixed update.
+2. **Two JIT-level NOPs** inside `CameraScript.MoveCamera` to stop the final `transform.position` / `transform.rotation` assignments.
+3. **Two Mono reflection calls per tick** that invoke `UnityEngine.Transform.Translate(single, single, single)` and `UnityEngine.Transform.Rotate(single, single, single)` on the cached Camera.main.transform, which become the only writers of camera pose after the patches above are in place.
 
-This hybrid approach - write blockers in native machine code plus movement through the managed Unity API - gives us camera control that is completely independent of the game's Time.deltaTime, Unity's update cycle, and the game's rotation / position invariants.
+For full mechanics and the reasoning behind every design choice, see [architecture.md](architecture.md).
 
-## How it works (deep dive)
+### Repo layout
 
-### 1. cam struct NOP patches (`CameraBlendProbe.UpdateWeightsPosition`)
+```
+playdead-INSIDE-FreeCam/
+  INSIDE_Gamepad_FreeCam.CT       main Cheat Engine table (everything lives here)
+  README.md                       this file
+  architecture.md                 technical deep dive into the patches and runtime state
+  RELEASE_NOTES_v1.0.0.md         notes for v1.0.0
+  LICENSE                         public domain (Unlicense)
+  inside_header.jpg               store page header used at the top of this README
+  .gitignore
+```
 
-Three instructions inside this method write to the probe's position / aim fields. They sit at symbol offsets:
+Everything the table does is inside `INSIDE_Gamepad_FreeCam.CT`. No external Lua modules, no compiled DLLs, no external dependencies other than Cheat Engine itself. Four `<CheatEntry>` blocks:
 
-| Offset from method start | Original bytes (10 / 10 / 7) | What it writes |
+| Entry ID | Description | Purpose |
 |---|---|---|
-| `+0x429` | `89 48 08 48 8D 86 F0 00 00 00` | zoom / depth + `lea rax,[rsi+F0]` follow-up |
-| `+0x41F` | `48 89 08 48 63 8D 18 FF FF FF` | Y / Z |
-| `+0x5F0` | `48 89 08 48 63 4D 88` | yaw / pitch components |
-
-We overwrite them with `0x90` NOPs on ENABLE, restore the original bytes on DISABLE. Detection is idempotent - if the scan sees `0x90 0x90 ...` already in place (left over from a previous Cheat Engine session that was closed without deactivation) it still accepts the site and records a canonical restore pattern, so DISABLE remains safe.
-
-These addresses were identified from [abarichello/inside-noclip](https://github.com/abarichello/inside-noclip) and have been stable across every Steam build of INSIDE we have tested.
-
-### 2. JIT NOP of `set_rotation` for 360° rotation
-
-The key problem with simply writing to `transform.rotation` or `Transform.eulerAngles` from Cheat Engine is that `CameraScript.MoveCamera()` overwrites it every frame by calling `LookRotation(blendAim - blendCamera, blendUp)` and assigning the result. We could not find a clean way to stop that short of disabling the entire `CameraScript`, which breaks other things (it also sets position, applies handshake, etc.).
-
-Solution: surgically NOP **only** the single `set_rotation` call inside `MoveCamera`, leaving the rest of the method to keep running.
-
-The JIT output for the line
-
-```csharp
-this._transform.rotation = quaternion;
-```
-
-compiles (on Mono 2.0 / x64) to:
-
-```
-mov  r11, <absolute address of Transform.set_rotation JIT thunk>   ; 49 BB XX XX XX XX XX XX XX XX   (10 bytes)
-call r11                                                           ; 41 FF D3                         (3 bytes, REX.B + call r11)
-```
-
-On ENABLE the table:
-
-1. Calls `mono_compile_method(set_rotation MonoMethod*)` to obtain the JIT address of `Transform.set_rotation`.
-2. Scans the first 16 KB of `CameraScript:MoveCamera` JIT body for the pattern `49 B8-BF <imm64 matching set_rotation>` followed by `41 FF D0-D7` (or the 2-byte form `FF D0-D7` for rax-rdi).
-3. Writes 3 × `0x90` over the `call r11` (or 2 × `0x90` for the non-REX form), keeping the `mov r11, imm64` in place (harmless, just loads the address into a register nobody reads).
-
-After this patch, `MoveCamera` computes the quaternion, *almost* writes it, and then slides past the NOPs without doing the store. Our `Transform.Rotate(0, dYaw, 0)` calls from the tick timer are then the only source of rotation changes on `Camera.main.transform`, giving us true 360° yaw.
-
-Cross-session safety: if the scan finds `0x90 0x90 0x90` where `41 FF D3` should be (previous session's leftover), it registers the address with canonical restore bytes `{0x41, 0xFF, 0xD3}` so DISABLE puts the camera system back. This means no "game camera forever frozen after CE crash" class of bug.
-
-### 3. JIT NOP of `set_position` for view-relative Translate
-
-Identical pattern, one instruction earlier in the same method (`this._transform.position = vector;`). With this NOP applied, `Transform.Translate(localX, localY, localZ)` - called once per tick with the aggregated delta from keyboard, right stick, triggers, and D-Pad U/D - becomes the only writer of camera position.
-
-Because `Translate` with three float args defaults to `Space.Self`, movement is automatically view-relative. `Translate(0, 1, 0)` pushes the camera along its own local +Y regardless of yaw. Since we never let the camera roll or pitch (D-Pad is yaw-only, no tilt), local Y equals world Y, so vertical input feels natural.
-
-### 4. Gamepad global listener entry (LB → FreeCam, RB → slow-mo)
-
-The main FreeCam `tick()` only runs while the FreeCam entry is active, so any gamepad key handled there can only *deactivate* the camera, not activate it. To give LB full on/off parity with F1, we introduced a separate always-active entry that:
-
-- Runs its own `createTimer` at 50 ms
-- Reads `getXBox360ControllerState(0)` each tick (this is Cheat Engine's built-in XInput wrapper - no Mono, no game interaction, no crash risk)
-- On LB edge (rising transition) calls `getAddressList().getMemoryRecordByDescription('ENABLE FreeCam (toggle: F1 / LB)').Active = not Active`
-- Same for RB and the Time Pause entry
-
-The `<CheatTable>` root has a `<LuaScript>` block that activates this listener on CT load, so the user never has to tick the checkbox. On `TargetProcess=INSIDE` auto-attach, the whole pipeline is hands-free from opening the `.CT` file.
-
-### 5. Auto-attach and auto-activate
-
-```xml
-<CheatTable CheatEngineTableVersion="45">
-  <TargetProcess>INSIDE</TargetProcess>
-  <LuaScript>
-    -- Activates the Gamepad Listener entry on table load
-  </LuaScript>
-  ...
-</CheatTable>
-```
-
-`TargetProcess` tells Cheat Engine to attach to `INSIDE` (no `.exe` suffix) when the table opens. If the process is not running, attach is deferred - as soon as INSIDE starts, Cheat Engine will pick it up.
-
-The top-level `<LuaScript>` runs once at table load, finds the Gamepad Listener by description, and sets `Active = true`. Cheat Engine prompts the user once per session to confirm Lua execution - after that, everything is automatic.
-
-## Known limitations
-
-- **Camera-relative Boy controls** (stick forward → Boy runs into the screen when camera is rotated 90°) is **not** implemented. Designed and researched (see [`docs/research-notes.md`](docs/research-notes.md)) but requires an AA trampoline hook into `GameInput.Core.UpdateCommand` that is several hours of careful low-level work. Deferred.
-- **Rotation is yaw-only** by design - D-Pad up/down moves the camera vertically instead of pitching. This prevents the horizon from tilting and makes the camera much easier to control in a 2.5D game. If you want pitch back, see [Extending](#extending--modifying-the-table).
-- **Aim-pan (RMB + mouse, arrows, legacy)** still writes to `cam+0xF0 / 0xF4` but those fields no longer affect the rendered camera because `set_rotation` is NOPed - kept mostly for legacy compat.
-- **Game scripts that call `GameObject.SetActive(Camera)` or swap cameras** (cinematic sequences, some puzzle rooms) may temporarily override the FreeCam. This is expected - the table is designed for exploration, not cutscene replacement. Toggle FreeCam off if the scripted sequence misbehaves.
-- **Very fast level transitions** may leave the cached `Transform` pointer stale for one frame; the table detects this and re-resolves automatically, but you may see a one-frame teleport in rare cases.
-
-## Roadmap / deferred work
-
-Tracked in [`docs/research-notes.md`](docs/research-notes.md). Highlights:
-
-- **Camera-relative Boy movement** (AA trampoline in `GameInput.Core.UpdateCommand`, ~4–5 hours)
-- Save/load camera rotation (quaternion) in bookmarks
-- FOV control (`Camera.main.fieldOfView` via Mono)
-- Record/replay camera path for flythrough videos
-- Per-state exceptions for the Boy-input rotation (skip in Swim / Ladder / Rope / Grab / ClimbDown states)
-
-## Extending / modifying the table
-
-All logic lives in Lua inside the `<AssemblerScript>` CDATA blocks of four entries:
-
-| ID | Description | Purpose |
-|---|---|---|
-| 2 | `ENABLE FreeCam (toggle: F1 / LB)` | main script - NOP patches, tick timer, movement logic, rotation |
-| 3 | `--- Camera state (read-only) ---` group | live read-only view of yaw / pitch / X / Y / Z for debugging |
+| 2 | `ENABLE FreeCam (toggle: F1 / LB)` | main script: NOP patches, tick timer, rotation + translate logic |
+| 3 | `--- Camera state (read-only) ---` group | live read-only display of yaw / pitch / X / Y / Z for debugging |
 | 9 | `Toggle Time Pause (toggle: `~ / RB)` | `Time.timeScale = 0.001` toggle via Mono |
-| 12 | `Gamepad toggle listener: LB=FreeCam, RB=Pause (keep enabled)` | background 50 ms polling timer |
+| 12 | `Gamepad toggle listener: LB=FreeCam, RB=Pause (keep enabled)` | background 50 ms polling timer; auto-activated on CT load |
 
-Everything is self-contained in the single `.CT` file - no external Lua modules, no side files, no DLL injection.
+### How to fix the table after an INSIDE update
 
-**Common mods:**
+If Playdead ships a patch to INSIDE and this table stops working, the repo has enough information to re-derive the offsets yourself. Here is the playbook.
 
-- **Restore D-Pad pitch**: in entry #2 tick, find the D-Pad yaw block and add `dPitch` handling before the `Rotate` call (there's a commented-out version in git history).
-- **Change speeds**: adjust the `MOUSE_SENS`, `PAN`, `ZOOM`, `GP_ROT`, `GP_PAN`, `GP_ZOOM`, `GP_DPAD_ROT`, `KEY_ROT` constants near the top of the ENABLE block.
-- **Different toggle keys**: edit the XML `<Hotkey><Key>N</Key></Hotkey>` VK-code inside entries #2 and #9. [VK code table](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes).
-- **Different gamepad bindings**: in entry #12 the listener checks `gp.GAMEPAD_LEFT_SHOULDER` / `GAMEPAD_RIGHT_SHOULDER` - swap those for any member of `getXBox360ControllerState()` (`GAMEPAD_A`, `GAMEPAD_Y`, `GAMEPAD_DPAD_*`, etc.).
+#### Symptom checklist
 
-## Troubleshooting
+When the table is broken, the Cheat Engine Lua console will tell you which part failed:
 
-### `Library Injection failed` / `cannot resolve CameraBlendProbe:UpdateWeightsPosition+429`
+- **`[FAIL] cannot resolve CameraBlendProbe:UpdateWeightsPosition+429`** (or `+41f`, `+5f0`): the three-byte NOP sites inside the probe are at different offsets now.
+- **`RESULT: 0 matches to set_rotation`**: the `mov r64, imm64 ; call r11` pattern inside `CameraScript.MoveCamera` is not where we expect it, either because the method body changed or the pattern encoding changed.
+- **`Camera.main.transform` returns null** or Transform cache is invalid: the pointer chain to the Camera changed, or the managed object layout changed.
+- **Game crashes on ENABLE**: a NOP landed in the middle of an instruction because the scan misidentified an offset.
 
-You tried to enable the table before Unity had a chance to JIT-compile the camera classes. **Start or load a save, reach an actual in-level screen**, then try again. Main menu and loading screens are too early.
+Work through them in the order below.
 
-### Camera doesn't rotate, D-Pad only slides in 2D
+#### Step 1: verify Mono is usable
 
-The `set_rotation` NOP did not apply. Possible causes:
-- JIT body layout changed (new game update). Check the ROTATION ANALYSIS section of the Lua console - if you see `RESULT: 0 matches to set_rotation`, the scan pattern needs updating. Please open an issue with the console output.
-- You reloaded the table without closing CE cleanly before; the re-use path should handle this, but if you see repeated `[REUSE]` messages and rotation still doesn't work, restart both Cheat Engine and INSIDE.
+Open the table, try to enable FreeCam from the main menu. You should see `LaunchMonoDataCollector returned false` or similar if Mono itself is broken. That would be a Cheat Engine / Unity incompatibility, not a table issue.
 
-### Slow-mo toggles but nothing happens to the game
+If Mono works, the Lua console will print the full ROTATION ANALYSIS section. Save that output, it contains everything you need to debug.
 
-`UnityEngine.Time.set_timeScale` could not be found. Reach an in-level screen first - in pure main menu Unity sometimes has not loaded the engine bindings yet.
+#### Step 2: rediscover the `CameraBlendProbe.UpdateWeightsPosition` offsets
 
-### LB / RB do nothing
+The three NOP sites in the probe may have moved. To find the new offsets:
 
-Make sure the `Gamepad toggle listener` entry has its checkbox ✓. On first open of the CT, Cheat Engine asks once whether to run the embedded Lua - you must accept. After that the listener auto-activates each session.
+1. In Cheat Engine, open `Memory Viewer` (Ctrl+M).
+2. Right-click the code pane, choose `Tools -> Dissect code` or navigate via `View -> Mono -> Mono dissector` (depending on CE version).
+3. Find `CameraBlendProbe.UpdateWeightsPosition` in the Mono class tree.
+4. Click to disassemble. Look for the **three consecutive writes** to the probe's struct fields, roughly:
+   - `mov [rax+8], rcx ; lea rax, [rsi+0xF0]` for field 1
+   - `mov [rax], rcx ; movsxd rcx, [rbp-something]` for fields 2 and 3
+5. Write down the **method-local offset** of each of the three write instructions (CE shows the offset as `CameraBlendProbe:UpdateWeightsPosition+NN` in the disassembly pane).
+6. Update the `NOP_SITES` table in the ENABLE script of entry #2, lines near the top. The `sym` field uses these offsets. The `orig` field is the exact byte sequence of the original instruction (count includes all modifier bytes).
 
-Also check in `GAMEPAD DIAGNOSTIC` (older builds of this table) or by testing another XInput tool that your controller actually enumerates as `XInput slot 0`. The listener only polls slot 0.
+Test: reload the table, enable. The NOP log should print without errors.
 
-### Cheat Engine crashes INSIDE on enable
+Reference: the original offsets (from abarichello's research, may or may not still be valid on your build) are `+0x429` / `+0x41F` / `+0x5F0`.
 
-Make sure INSIDE has been running for a few seconds before you enable. The very first JIT pass for any class can stall Mono for ~100 ms, and stacking our `mono_compile_method` calls on top of that can occasionally race. Wait, retry.
+#### Step 3: rediscover the cam struct pointer chain
 
-### "Game camera frozen" after Cheat Engine crashed
+The pointer chain from `INSIDE.exe + 0xF8D6B0` to the probe's `cameraPosition` float may have shifted. To find it:
 
-Close and re-open Cheat Engine, then open the CT and **activate then deactivate** the FreeCam entry once. The DISABLE block restores the original `set_rotation` / `set_position` call bytes even if the previous session left them NOPed. As of v1.0 this is handled automatically.
+1. In Cheat Engine, do a value scan for a known camera coordinate. You can read current values from the existing "Camera state" group in the table even if the rest is broken, as long as Mono resolution works.
+2. Alternative: scan for `4-byte Float` with the camera's current X, move the Boy, rescan with new X.
+3. When you have the address of one of the three camera position floats, right-click it, choose `Pointer scan for this address`.
+4. CE will open a pointer scanner. Set base module to `INSIDE.exe`, click OK.
+5. After the scan completes, look for short, repeatable pointer chains of length 3 to 5 that hit the same address reliably across game restarts.
+6. Update `resolveCamStruct()` in the ENABLE script with the new base offset (`INSIDE.exe + X`) and the new chain of offsets.
 
-## Credits
+Reference: the original chain is `INSIDE.exe + 0xF8D6B0 -> [0] -> [+0x6B8] -> [+0x28] -> deref -> +0x58 -> deref`.
 
-- **abarichello** - original [inside-noclip](https://github.com/abarichello/inside-noclip) Cheat Engine table, which pinpointed the three `CameraBlendProbe` NOP sites this project builds on.
-- **Dark Byte** and the Cheat Engine community - for `mono_invoke_method`, `mono_compile_method`, and the Mono Lua bindings that make JIT-aware hooking from Lua tractable.
-- **Playdead** - for INSIDE, a remarkable game.
+#### Step 4: verify the `set_rotation` / `set_position` JIT pattern
 
-## License
+The `mov r64, imm64 ; call r11` pattern inside `CameraScript.MoveCamera` is quite stable because Mono 2.0 on x64 almost always emits it for calls to internal setters. But if the scan finds zero matches:
 
-[The Unlicense](LICENSE) - this is free and unencumbered software released into the public domain. Do whatever you want.
+1. In the Lua console, look at the ROTATION ANALYSIS section's `Found N control-transfer instructions in first 16KB` block.
+2. If you see `RESULT: 0 matches to set_rotation`, manually step through the first dump of 20 calls and compare with what you see in Memory Viewer at the `CameraScript:MoveCamera` address.
+3. The call pattern for a method write is typically `49 B? XX XX XX XX XX XX XX XX 41 FF D?` (REX.W mov, 8-byte imm, REX.B call r8-r15). Check whether:
+   - Mono emits a different `mov` form (less common: `movabs`, `lea`)
+   - The call target goes through a trampoline instead of directly to the JIT thunk
+   - The method body is larger than 16 KB so the call sits past the scan window
+4. Adjust `SCAN_LEN` higher or broaden the pattern matching in the analysis block of the ENABLE script (search for `mov r64, imm64` and `call reg` patterns).
+
+Reference: the current scan matches `mov r64, <set_rotation JIT>` followed by `41 FF D3` (call r11), with the whole pattern at `+0xA73` and `+0xA7D` inside `MoveCamera`.
+
+#### Step 5: confirm `Transform.Rotate` / `Transform.Translate` overloads still take three singles
+
+Very unlikely to change (Unity's public API has been stable for over a decade), but if the Mono reflection path starts returning `nil`, re-run the enumeration:
+
+1. In the Lua console, look at the TRANSLATE ANALYSIS section. It prints every `Translate` overload with its signature.
+2. The line ending with `^^^ TARGET: 3-float overload = 0x...` is the one we invoke.
+3. If no such line appears, the signature matching `single,single,single` failed. Check what Mono actually exposes by examining the other overload prints.
+4. If Unity has changed the API, adjust the signature filter in the enumeration code of entry #2.
+
+#### Step 6: test slow-mo independently
+
+`UnityEngine.Time.set_timeScale` is a core Unity API that does not change. If Toggle Time Pause stops working, it is almost certainly a Mono infrastructure issue, not a table issue. Check `LaunchMonoDataCollector()` return value and whether other Mono operations work.
+
+### Runtime state
+
+All state kept in the global Lua table `_G` (Cheat Engine's Lua state persists across Reload Table). Cleanup happens in each entry's DISABLE:
+
+| Global | Purpose |
+|---|---|
+| `INSIDE_CAM_NOP_SITES` | list of probe NOP sites with addr + original bytes |
+| `INSIDE_CAM_RELEASED` | whether probe NOPs are currently released (hold-to-track mode) |
+| `INSIDE_CAM_SETTS` / `_GETTS` | cached `UnityEngine.Time.set_timeScale` / `get_timeScale` methods |
+| `INSIDE_CAM_SNAP_TSWAS` | timeScale saved during R-snap (restored on release) |
+| `INSIDE_CAM_TIMER` | the main tick timer |
+| `INSIDE_CAM_CLASS` / `_GETMAIN` | cached `UnityEngine.Camera` class + `get_main` method |
+| `INSIDE_MAIN_TRANSFORM_CACHED` | cached `Camera.main.transform` managed object pointer |
+| `INSIDE_TR_GET_EULER` | cached `Transform.get_eulerAngles` (legacy) |
+| `INSIDE_ROTATE_3F` | resolved `Transform.Rotate(single,single,single)` address |
+| `INSIDE_TRANSLATE_3F` | resolved `Transform.Translate(single,single,single)` address |
+| `INSIDE_MOVECAM_NOP_ADDR` / `_ORIG` / `_SIZE` | set_rotation NOP bookkeeping |
+| `INSIDE_MOVECAM_SETPOS_NOP_ADDR` / `_ORIG` / `_SIZE` | set_position NOP bookkeeping |
+| `INSIDE_CAM_AUTO_RELEASED` / `_SETTLE_UNTIL` | level-transition state machine |
+| `INSIDE_LBGLOBAL_PREV` / `INSIDE_RBGLOBAL_PREV` | edge detection for LB / RB in listener |
+| `INSIDE_GPLISTEN_TIMER` | gamepad listener timer handle |
+| `INSIDE_PAUSE_PREV` / `INSIDE_PAUSE_SETTS` | Time Pause entry state |
+
+### Known limitations
+
+- **Camera-relative Boy controls** (stick forward = Boy runs into the screen when camera is rotated 90 degrees) is not in this release. The research and design are complete (see the "Deferred work" section in architecture.md). It needs an AA trampoline hook into `GameInput.Core.UpdateCommand`, roughly 4 to 5 hours of careful low-level work.
+- **Rotation is yaw-only** by design. D-Pad up/down moves the camera vertically instead of pitching. Keeps the horizon level and makes the camera much easier to use in a 2.5D game.
+- **Aim-pan inputs** (mouse RMB, arrow keys) still write to the legacy `cam+0xF0` / `+0xF4` fields but have no visible effect once `set_rotation` is NOPed. Kept for legacy compat, can be removed.
+- **Game scripts that swap cameras** (cinematic sequences, some puzzle rooms) may temporarily override the FreeCam. Expected; toggle FreeCam off for those sequences.
+- **Fast level transitions** can leave the cached Transform pointer stale for one frame. The table detects this and re-resolves, but you may see a single-frame teleport in rare cases.
+
+### Credits
+
+- **abarichello** for the original [inside-noclip](https://github.com/abarichello/inside-noclip) Cheat Engine table. The three `CameraBlendProbe` NOP sites this project builds on were identified there first.
+- **Dark Byte** and the Cheat Engine community for `mono_invoke_method`, `mono_compile_method`, and the Mono Lua bindings that make JIT-aware hooking from Lua practical.
+- **Playdead** for INSIDE.
+
+### License
+
+[The Unlicense](LICENSE). Public domain. Do whatever you want with it.
