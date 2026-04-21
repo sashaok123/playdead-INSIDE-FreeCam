@@ -1,0 +1,1041 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45">
+  <!-- Auto-attach to the game when this table is opened -->
+  <TargetProcess>INSIDE</TargetProcess>
+
+  <!-- Lua that runs as soon as the table is loaded.
+       Activates the Gamepad Listener entry automatically so LB/RB toggles
+       work right away without user having to tick the checkbox manually. -->
+  <LuaScript>
+if pcall(function()
+  local al = getAddressList()
+  if not al then return end
+  local mr = al.getMemoryRecordByDescription('Gamepad toggle listener: LB=FreeCam, RB=Pause (keep enabled)')
+  if mr and not mr.Active then
+    mr.Active = true
+  end
+end) then end
+  </LuaScript>
+
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"=== INSIDE FreeCam (orbit camera, NOP-based) ==="</Description>
+      <GroupHeader>1</GroupHeader>
+    </CheatEntry>
+
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"ENABLE FreeCam (toggle: F1 / LB)"</Description>
+      <LastState Activated="0"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript><![CDATA[[ENABLE]
+{$lua}
+if syntaxcheck then return end
+print('=== INSIDE FreeCam: enabling (orbit-style, NOP game writes) ===')
+
+if not LaunchMonoDataCollector() then
+  print('  [FAIL] LaunchMonoDataCollector returned false')
+  error('LaunchMonoDataCollector failed')
+end
+
+-- 1. Constants — baseline speeds are the smooth/comfortable values.
+-- Ctrl = 5x (zoom across a room), Shift = 3x, Shift+Ctrl = 15x (cross level).
+local MOUSE_SENS      = 0.010
+local MOUSE_MAX_DELTA = 25
+local PAN             = 0.05
+local ZOOM            = 0.03
+local GP_ROT          = 0.5   -- right stick rotation (was 0.8 — user asked to slow down)
+local GP_PAN          = 0.30
+local GP_ZOOM         = 0.18
+local GP_DPAD_ROT     = 1.5   -- D-pad rotation per tick (fast constant rate, ~3x right stick)
+local KEY_ROT         = 0.6   -- Arrow keys rotation per tick
+
+-- 2. NOP sites + original bytes (bytes taken from abarichello/inside-noclip reference)
+--    Field mapping at cam+off:
+--      +0xF0 = yaw        +0xF4 = pitch
+--      +0xF8 = X / zoom   +0xFC = Z (pan L/R)   +0x100 = Y (up/down)
+local NOP_SITES = {
+  { name='zoom_xy',   sym='CameraBlendProbe:UpdateWeightsPosition+429',
+    orig={0x89,0x48,0x08,0x48,0x8D,0x86,0xF0,0x00,0x00,0x00} },
+  { name='yz',        sym='CameraBlendProbe:UpdateWeightsPosition+41f',
+    orig={0x48,0x89,0x08,0x48,0x63,0x8D,0x18,0xFF,0xFF,0xFF} },
+  { name='yaw_pitch', sym='CameraBlendProbe:UpdateWeightsPosition+5f0',
+    orig={0x48,0x89,0x08,0x48,0x63,0x4D,0x88} },
+}
+
+local function bytesToHex(tbl)
+  local out = {}
+  for i, b in ipairs(tbl) do out[i] = string.format('%02X', b) end
+  return table.concat(out, ' ')
+end
+
+local function applyNOPs()
+  for _, site in ipairs(NOP_SITES) do
+    local addr = getAddress(site.sym)
+    if not addr or addr == 0 then
+      print(string.format('  [FAIL] cannot resolve %s', site.sym))
+      print('  => Start a level first (not main menu / loading). Unity JIT')
+      print('     compiles methods only when the class is used in-game.')
+      error('NOP site unresolved: ' .. site.sym)
+    end
+    site.addr = addr
+    local live = readBytes(addr, #site.orig, true)
+    if live then
+      local liveHex = bytesToHex(live)
+      local origHex = bytesToHex(site.orig)
+      if liveHex ~= origHex then
+        print(string.format('  [WARN] %s @ %X live=%s expected=%s (patching anyway)',
+          site.name, addr, liveHex, origHex))
+      end
+    end
+    local nops = {}
+    for i = 1, #site.orig do nops[i] = 0x90 end
+    writeBytes(addr, nops)
+    print(string.format('  [OK] NOP %s @ %X (%d bytes)', site.name, addr, #site.orig))
+  end
+end
+
+local function restoreNOPs()
+  for _, site in ipairs(NOP_SITES) do
+    if site.addr and site.addr ~= 0 then
+      writeBytes(site.addr, site.orig)
+    end
+  end
+end
+
+applyNOPs()
+_G['INSIDE_CAM_NOP_SITES']  = NOP_SITES
+_G['INSIDE_CAM_RELEASED']   = false
+_G['INSIDE_CAM_GRACE_UNTIL']= 0
+
+local function releaseNOPs()
+  if _G['INSIDE_CAM_RELEASED'] then return end
+  for _, site in ipairs(NOP_SITES) do
+    if site.addr and site.addr ~= 0 then
+      writeBytes(site.addr, site.orig)
+    end
+  end
+  _G['INSIDE_CAM_RELEASED'] = true
+end
+
+local function reapplyNOPs()
+  if not _G['INSIDE_CAM_RELEASED'] then return end
+  for _, site in ipairs(NOP_SITES) do
+    if site.addr and site.addr ~= 0 then
+      local nops = {}
+      for i = 1, #site.orig do nops[i] = 0x90 end
+      writeBytes(site.addr, nops)
+    end
+  end
+  _G['INSIDE_CAM_RELEASED'] = false
+end
+
+-- 3. Pointer chain to camera struct
+local function resolveCamStruct()
+  local p = getAddress('INSIDE.exe') + 0xF8D6B0
+  for _, off in ipairs({0, 0x6B8, 0x28}) do
+    p = readPointer(p); if not p or p == 0 then return nil end
+    p = p + off
+  end
+  p = readPointer(p); if not p or p == 0 then return nil end
+  p = p + 0x58
+  p = readPointer(p)
+  return p
+end
+
+-- 4. Cache UnityEngine.Time methods — ONLY for R-press unpause, NEVER called in tick
+do
+  local timeClass = mono_findClass('UnityEngine', 'Time')
+  if timeClass and timeClass ~= 0 then
+    _G['INSIDE_CAM_SETTS'] = mono_class_findMethod(timeClass, 'set_timeScale')
+    _G['INSIDE_CAM_GETTS'] = mono_class_findMethod(timeClass, 'get_timeScale')
+  end
+end
+
+-- 4b. ARG-exploration Mono methods — resolved ONCE, called only edge-triggered
+-- If any class/method is missing (Unity 5.0.4 may lack some), the feature degrades
+-- silently (no crash). Warnings printed once at enable time.
+do
+  local cameraClass = mono_findClass('UnityEngine', 'Camera')
+  if cameraClass and cameraClass ~= 0 then
+    _G['INSIDE_CAM_CLASS']        = cameraClass
+    _G['INSIDE_CAM_GETMAIN']      = mono_class_findMethod(cameraClass, 'get_main')
+    -- Transform.Rotate(float, float, float) — 3 primitive args, not Vector3.
+    -- CE can marshal 3 separate floats even though Vector3 struct breaks.
+    -- Used by D-Pad for TRUE yaw rotation (not aim-panning).
+    local compClass = mono_findClass('UnityEngine', 'Component')
+    local tClass    = mono_findClass('UnityEngine', 'Transform')
+    if compClass and tClass then
+      local getTrans = mono_class_findMethod(compClass, 'get_transform')
+      local getMain  = _G['INSIDE_CAM_GETMAIN']
+      if getTrans and getMain then
+        local ok, mainCam = pcall(mono_invoke_method, nil, getMain, nil, {})
+        if ok and mainCam and mainCam ~= 0 then
+          local ok2, tr = pcall(mono_invoke_method, nil, getTrans, mainCam, {})
+          if ok2 and tr and tr ~= 0 then
+            _G['INSIDE_MAIN_TRANSFORM_CACHED'] = tr
+            _G['INSIDE_TRANSFORM_ROTATE'] = mono_class_findMethod(tClass, 'Rotate')
+            if _G['INSIDE_TRANSFORM_ROTATE'] then
+              print('  [OK] Transform.Rotate resolved for D-Pad true rotation')
+            end
+            -- Transform.get_eulerAngles — used per-tick (guarded) to derive
+            -- view-relative forward/right vectors for WASD / left stick / triggers.
+            _G['INSIDE_TR_GET_EULER'] = mono_class_findMethod(tClass, 'get_eulerAngles')
+            if _G['INSIDE_TR_GET_EULER'] then
+              print('  [OK] Transform.get_eulerAngles resolved for view-relative motion')
+            else
+              print('  [WARN] Transform.get_eulerAngles not found — motion will fall back to world axes')
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+-- ================== Rotation ANALYSIS (READ-ONLY, no writes) ==================
+-- Collect info about Transform.Rotate overloads + CameraScript:MoveCamera JIT
+-- so we can DECIDE whether/what to NOP and which overload to invoke.
+-- This block PRINTS data only — does NOT modify memory.
+do
+  local ok_outer, err_outer = pcall(function()
+    print('')
+    print('========== ROTATION ANALYSIS (read-only) ==========')
+
+    local tClass = mono_findClass('UnityEngine', 'Transform')
+    if not tClass or tClass == 0 then
+      print('  Transform class missing — skip')
+      return
+    end
+
+    -- A) Enumerate all Rotate overloads + auto-pick single,single,single
+    print('--- Transform.Rotate overloads ---')
+    local ok, methods = pcall(mono_class_enumMethods, tClass)
+    local rotate3F = nil  -- will hold addr of Rotate(single,single,single)
+    if ok and type(methods) == 'table' then
+      print(string.format('  enumMethods returned %d methods total', #methods))
+      for _, m in ipairs(methods) do
+        local mname = m.name or m.methodname or m.Name
+        local maddr = m.method or m.address or m.Method or m.Address
+        if mname == 'Rotate' and maddr and maddr ~= 0 then
+          -- Get signature via confirmed working API
+          local ok_s, sig = pcall(mono_method_getSignature, maddr)
+          if ok_s and type(sig) == 'string' then
+            print(string.format('  Rotate 0x%X  sig=(%s)', maddr, sig))
+            if sig == 'single,single,single' then
+              rotate3F = maddr
+              print(string.format('    ^^^ TARGET: 3-float overload = 0x%X', maddr))
+            end
+          else
+            print(string.format('  Rotate 0x%X  (no signature available)', maddr))
+          end
+        end
+      end
+    end
+    _G['INSIDE_ROTATE_3F'] = rotate3F
+    if not rotate3F then
+      print('  [WARN] Rotate(single,single,single) not found — D-Pad will stay in fallback')
+    end
+
+    -- B) Resolve set_rotation (MonoMethod + JIT)
+    print('--- set_rotation ---')
+    local setRotMM = mono_class_findMethod(tClass, 'set_rotation')
+    print(string.format('  MonoMethod* = 0x%X', setRotMM or 0))
+    local setRotJit = 0
+    local ok_c, jit = pcall(mono_compile_method, setRotMM)
+    if ok_c and jit and jit ~= 0 then
+      setRotJit = jit
+      print(string.format('  JIT compiled = 0x%X', jit))
+    else
+      print('  mono_compile_method failed or unavailable')
+    end
+
+    -- C) CameraScript:MoveCamera address + first 32 bytes dump
+    print('--- CameraScript:MoveCamera ---')
+    local mcAddr = getAddress('CameraScript:MoveCamera')
+    if not mcAddr or mcAddr == 0 then
+      print('  MoveCamera not resolvable (be in a level first)')
+      return
+    end
+    print(string.format('  address = 0x%X', mcAddr))
+    local preview = readBytes(mcAddr, 32, true)
+    if preview then
+      local hex = {}
+      for i, b in ipairs(preview) do
+        hex[i] = string.format('%02X', b)
+      end
+      print('  first 32 bytes: ' .. table.concat(hex, ' '))
+    end
+
+    -- D) Scan for call/jmp to set_rotation (LOG ALL, no NOP)
+    print('--- call/jmp scan (first 16 KB of MoveCamera, NO writes) ---')
+    local SCAN_LEN = 16000
+    local i = 0
+    local allCalls = {}       -- list of {offset, type, target}
+    local matches = 0
+    while i < SCAN_LEN do
+      local b = readBytes(mcAddr + i, 1, false)
+      if b == 0xE8 or b == 0xE9 then
+        -- Direct rel32 call (E8) or jmp (E9 tail-call)
+        local rel = readInteger(mcAddr + i + 1)
+        local target = mcAddr + i + 5 + rel
+        local kind = (b == 0xE8) and 'call' or 'jmp'
+        table.insert(allCalls, {off=i, kind=kind, target=target})
+        if target == setRotJit or target == setRotMM then
+          matches = matches + 1
+          print(string.format('  *** MATCH %s @ +0x%X → 0x%X (set_rotation)', kind, i, target))
+        end
+        i = i + 5
+      elseif b == 0xFF then
+        local b2 = readBytes(mcAddr + i + 1, 1, false)
+        if b2 == 0x15 or b2 == 0x25 then
+          -- Indirect call (FF 15) or jmp (FF 25) via [rip+disp32]
+          local disp = readInteger(mcAddr + i + 2)
+          local pptr = mcAddr + i + 6 + disp
+          local ok3, targetPtr = pcall(readQword, pptr)
+          local kind = (b2 == 0x15) and 'call' or 'jmp'
+          table.insert(allCalls, {off=i, kind=kind..'[mem]', target=targetPtr or 0, pptr=pptr})
+          if ok3 and targetPtr and (targetPtr == setRotJit or targetPtr == setRotMM) then
+            matches = matches + 1
+            print(string.format('  *** MATCH indirect %s @ +0x%X → [0x%X]=0x%X (set_rotation)',
+              kind, i, pptr, targetPtr))
+          end
+          i = i + 6
+        elseif b2 == 0xD0 or b2 == 0xD1 or b2 == 0xD2 or b2 == 0xD3 then
+          -- call rax/rcx/rdx/rbx — register-indirect, can't statically resolve target
+          table.insert(allCalls, {off=i, kind='call reg', target=0})
+          i = i + 2
+        elseif b2 >= 0xE0 and b2 <= 0xE7 then
+          -- jmp rax..r15 register-indirect
+          table.insert(allCalls, {off=i, kind='jmp reg', target=0})
+          i = i + 2
+        else
+          i = i + 1
+        end
+      elseif b == 0x48 or b == 0x49 then
+        -- REX.W prefix — may be start of `mov r64, imm64` (0x48/49 + B8..BF + 8 bytes imm64)
+        local b2 = readBytes(mcAddr + i + 1, 1, false)
+        if b2 and b2 >= 0xB8 and b2 <= 0xBF then
+          local ok_imm, imm = pcall(readQword, mcAddr + i + 2)
+          if ok_imm and imm == setRotJit then
+            matches = matches + 1
+            print(string.format('  *** MATCH mov r64, imm64(set_rotation) @ +0x%X', i))
+            -- After `mov r64, imm64` (10 bytes), expected call register patterns:
+            --   FF D0..D7       (2 bytes)  — call rax..rbx/rsp/rbp/rsi/rdi
+            --   41 FF D0..D7    (3 bytes)  — call r8..r15 (REX.B prefix)
+            local callOff = i + 10
+            local cb1 = readBytes(mcAddr + callOff,     1, false)
+            local cb2 = readBytes(mcAddr + callOff + 1, 1, false)
+            local cb3 = readBytes(mcAddr + callOff + 2, 1, false)
+            if cb1 == 0xFF and cb2 and cb2 >= 0xD0 and cb2 <= 0xD7 then
+              -- 2-byte form: call rax..rdi
+              print(string.format('    followed by call r%d @ +0x%X (FF %02X) — NOP 2 bytes',
+                (cb2 - 0xD0), callOff, cb2))
+              _G['INSIDE_MOVECAM_NOP_ADDR'] = mcAddr + callOff
+              _G['INSIDE_MOVECAM_NOP_ORIG'] = readBytes(mcAddr + callOff, 2, true)
+              _G['INSIDE_MOVECAM_NOP_SIZE'] = 2
+            elseif cb1 == 0x41 and cb2 == 0xFF and cb3 and cb3 >= 0xD0 and cb3 <= 0xD7 then
+              -- 3-byte form: REX.B + call r8..r15
+              print(string.format('    followed by call r%d @ +0x%X (41 FF %02X) — NOP 3 bytes',
+                (cb3 - 0xD0 + 8), callOff, cb3))
+              _G['INSIDE_MOVECAM_NOP_ADDR'] = mcAddr + callOff
+              _G['INSIDE_MOVECAM_NOP_ORIG'] = readBytes(mcAddr + callOff, 3, true)
+              _G['INSIDE_MOVECAM_NOP_SIZE'] = 3
+            elseif cb1 == 0x90 and cb2 == 0x90 and cb3 == 0x90 then
+              -- ALREADY NOP'd from previous CE session (closed without DISABLE).
+              -- Register addr so D-Pad rotation still works; use canonical
+              -- `41 FF D3` (call r11) as restore bytes so DISABLE puts camera back.
+              print(string.format('    already NOP\'d @ +0x%X (leftover from prev session) — reusing, canonical restore bytes', callOff))
+              _G['INSIDE_MOVECAM_NOP_ADDR'] = mcAddr + callOff
+              _G['INSIDE_MOVECAM_NOP_ORIG'] = {0x41, 0xFF, 0xD3}
+              _G['INSIDE_MOVECAM_NOP_SIZE'] = 3
+            elseif cb1 == 0x90 and cb2 == 0x90 then
+              -- 2-byte already NOP'd
+              print(string.format('    already NOP\'d (2-byte) @ +0x%X — reusing, canonical restore bytes', callOff))
+              _G['INSIDE_MOVECAM_NOP_ADDR'] = mcAddr + callOff
+              _G['INSIDE_MOVECAM_NOP_ORIG'] = {0xFF, 0xD3}
+              _G['INSIDE_MOVECAM_NOP_SIZE'] = 2
+            else
+              print(string.format('    NOT followed by call reg (found %02X %02X %02X) — cannot safely NOP',
+                cb1 or 0, cb2 or 0, cb3 or 0))
+            end
+          end
+          i = i + 10  -- REX + opcode + 8-byte imm
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    end
+
+    -- Print all calls found — helps spot which are Unity API vs others
+    print(string.format('  Found %d control-transfer instructions in first 16KB:', #allCalls))
+    for idx, c in ipairs(allCalls) do
+      if idx <= 20 then  -- cap to 20 to avoid log flood
+        if c.target and c.target ~= 0 then
+          print(string.format('    #%d %s @ +0x%X → 0x%X', idx, c.kind, c.off, c.target))
+        else
+          print(string.format('    #%d %s @ +0x%X', idx, c.kind, c.off))
+        end
+      end
+    end
+    if #allCalls > 20 then
+      print(string.format('    ... %d more (truncated)', #allCalls - 20))
+    end
+    print(string.format('  RESULT: %d matches to set_rotation', matches))
+
+    -- E) APPLY: if we have both the 3-float overload AND a safe NOP target, apply.
+    local nopAddr = _G['INSIDE_MOVECAM_NOP_ADDR']
+    if rotate3F and nopAddr then
+      local orig = _G['INSIDE_MOVECAM_NOP_ORIG']
+      local size = _G['INSIDE_MOVECAM_NOP_SIZE'] or 2
+      local nops = {}
+      local origHex = {}
+      for k = 1, size do
+        nops[k] = 0x90
+        origHex[k] = string.format('%02X', orig[k] or 0)
+      end
+      pcall(writeBytes, nopAddr, nops)
+      print(string.format('  [APPLIED] NOPed set_rotation call @ 0x%X (%d bytes, was %s)',
+            nopAddr, size, table.concat(origHex, ' ')))
+      print(string.format('  [APPLIED] D-Pad will use Rotate(single,single,single) @ 0x%X', rotate3F))
+    else
+      if not rotate3F then print('  [SKIP] apply: no 3-float Rotate overload resolved') end
+      if not nopAddr  then print('  [SKIP] apply: no safe NOP target found') end
+    end
+
+    print('========== ANALYSIS COMPLETE ==========')
+    print('')
+  end)
+  if not ok_outer then
+    print('  [WARN] Analysis block crashed: ' .. tostring(err_outer))
+  end
+end
+
+-- ================== Translate Hack (view-relative movement) ==================
+-- Same pattern as Rotate: find 3-float Translate overload + NOP call set_position
+-- in CameraScript.MoveCamera so our Translate sticks. Unity's Transform.Translate
+-- defaults to Space.Self, so (x,y,z) is interpreted in camera-local axes —
+-- exactly what "WASD moves forward relative to view" requires.
+do
+  local ok_outer, err_outer = pcall(function()
+    print('========== TRANSLATE ANALYSIS (view-relative movement) ==========')
+    local tClass = mono_findClass('UnityEngine', 'Transform')
+    if not tClass or tClass == 0 then
+      print('  Transform class missing — skip Translate hack')
+      return
+    end
+
+    -- A) Find Translate(single,single,single) overload
+    local translate3F = nil
+    local ok, methods = pcall(mono_class_enumMethods, tClass)
+    if ok and type(methods) == 'table' then
+      for _, m in ipairs(methods) do
+        local mname = m.name or m.methodname or m.Name
+        local maddr = m.method or m.address or m.Method or m.Address
+        if mname == 'Translate' and maddr and maddr ~= 0 then
+          local ok_s, sig = pcall(mono_method_getSignature, maddr)
+          if ok_s and type(sig) == 'string' then
+            print(string.format('  Translate 0x%X  sig=(%s)', maddr, sig))
+            if sig == 'single,single,single' and not translate3F then
+              translate3F = maddr
+              print(string.format('    ^^^ TARGET: 3-float overload = 0x%X', maddr))
+            end
+          end
+        end
+      end
+    end
+    _G['INSIDE_TRANSLATE_3F'] = translate3F
+    if not translate3F then
+      print('  [WARN] Translate 3-float overload not found — movement will stay world-axis')
+      return
+    end
+
+    -- B) Resolve set_position (MonoMethod + JIT) and scan MoveCamera for the call
+    local setPosMM = mono_class_findMethod(tClass, 'set_position')
+    local moveCamAddr = getAddress('CameraScript:MoveCamera')
+    if not setPosMM or not moveCamAddr or setPosMM == 0 or moveCamAddr == 0 then
+      print('  [WARN] set_position MonoMethod or MoveCamera address missing')
+      _G['INSIDE_TRANSLATE_3F'] = nil
+      return
+    end
+    local setPosJit = 0
+    local ok_c, jit = pcall(mono_compile_method, setPosMM)
+    if ok_c and jit and jit ~= 0 then setPosJit = jit end
+    print(string.format('  set_position MonoMethod=0x%X  JIT=0x%X', setPosMM, setPosJit))
+
+    -- Scan 16 KB for `mov r64, imm64(set_position)` followed by call reg (same
+    -- exact pattern we already handled for set_rotation).
+    local SCAN_LEN = 16000
+    local i = 0
+    local found = false
+    while i < SCAN_LEN do
+      local b = readBytes(moveCamAddr + i, 1, false)
+      if b == 0x48 or b == 0x49 then
+        local b2 = readBytes(moveCamAddr + i + 1, 1, false)
+        if b2 and b2 >= 0xB8 and b2 <= 0xBF then
+          local ok_imm, imm = pcall(readQword, moveCamAddr + i + 2)
+          if ok_imm and imm and (imm == setPosJit or imm == setPosMM) then
+            local callOff = i + 10
+            local cb1 = readBytes(moveCamAddr + callOff,     1, false)
+            local cb2 = readBytes(moveCamAddr + callOff + 1, 1, false)
+            local cb3 = readBytes(moveCamAddr + callOff + 2, 1, false)
+            if cb1 == 0xFF and cb2 and cb2 >= 0xD0 and cb2 <= 0xD7 then
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR'] = moveCamAddr + callOff
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ORIG'] = readBytes(moveCamAddr + callOff, 2, true)
+              _G['INSIDE_MOVECAM_SETPOS_NOP_SIZE'] = 2
+              pcall(writeBytes, moveCamAddr + callOff, {0x90, 0x90})
+              print(string.format('  [APPLIED] NOPed set_position call r%d @ +0x%X (2 bytes)',
+                (cb2 - 0xD0), callOff))
+              print(string.format('  [APPLIED] WASD/triggers/left stick will use Translate(single,single,single) @ 0x%X', translate3F))
+              found = true
+              break
+            elseif cb1 == 0x41 and cb2 == 0xFF and cb3 and cb3 >= 0xD0 and cb3 <= 0xD7 then
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR'] = moveCamAddr + callOff
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ORIG'] = readBytes(moveCamAddr + callOff, 3, true)
+              _G['INSIDE_MOVECAM_SETPOS_NOP_SIZE'] = 3
+              pcall(writeBytes, moveCamAddr + callOff, {0x90, 0x90, 0x90})
+              print(string.format('  [APPLIED] NOPed set_position call r%d @ +0x%X (3 bytes, REX.B)',
+                (cb3 - 0xD0 + 8), callOff))
+              print(string.format('  [APPLIED] WASD/triggers/left stick will use Translate(single,single,single) @ 0x%X', translate3F))
+              found = true
+              break
+            elseif cb1 == 0x90 and cb2 == 0x90 and cb3 == 0x90 then
+              -- Already NOP'd from previous CE session — reuse, canonical restore bytes
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR'] = moveCamAddr + callOff
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ORIG'] = {0x41, 0xFF, 0xD3}
+              _G['INSIDE_MOVECAM_SETPOS_NOP_SIZE'] = 3
+              print(string.format('  [REUSE] set_position call already NOP\'d @ +0x%X (prev session leftover)', callOff))
+              print(string.format('  [APPLIED] WASD/triggers/left stick will use Translate(single,single,single) @ 0x%X', translate3F))
+              found = true
+              break
+            elseif cb1 == 0x90 and cb2 == 0x90 then
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR'] = moveCamAddr + callOff
+              _G['INSIDE_MOVECAM_SETPOS_NOP_ORIG'] = {0xFF, 0xD3}
+              _G['INSIDE_MOVECAM_SETPOS_NOP_SIZE'] = 2
+              print(string.format('  [REUSE] set_position call already NOP\'d (2-byte) @ +0x%X', callOff))
+              print(string.format('  [APPLIED] WASD/triggers/left stick will use Translate(single,single,single) @ 0x%X', translate3F))
+              found = true
+              break
+            end
+          end
+          i = i + 10
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    end
+    if not found then
+      print('  [WARN] set_position call not found in MoveCamera scan — movement will stay world-axis')
+      _G['INSIDE_TRANSLATE_3F'] = nil  -- no NOP, so invoking Translate would fight the game's per-frame set_position
+    end
+    print('========== TRANSLATE ANALYSIS COMPLETE ==========')
+    print('')
+  end)
+  if not ok_outer then
+    print('  [WARN] Translate hack crashed: ' .. tostring(err_outer))
+    -- Defensive: clear so tick falls back
+    _G['INSIDE_TRANSLATE_3F'] = nil
+  end
+end
+
+-- 5. Input constants
+local VK = { W=0x57, A=0x41, S=0x53, D=0x44, Q=0x51, E=0x45, R=0x52,
+             SHIFT=0x10, CTRL=0x11, SPACE=0x20,
+             NPPLUS=0x6B, NPMINUS=0x6D,
+             LEFT=0x25, UP=0x26, RIGHT=0x27, DOWN=0x28 }
+local VK_RBUTTON = 0x02
+
+-- 6. Mouse tracking
+local prevMX, prevMY = getMousePos()
+
+-- 7. Diagnostic rate-limit
+local lastDiagMs = 0
+local function nowMs() return math.floor(getTickCount()) end
+
+-- 8. Tick function — PURE readFloat/writeFloat, no Mono invokes
+local function tick()
+  -- (a) hold-to-track handlers (work without cam resolve)
+  -- Gamepad A was the original snap key, but A = jump in INSIDE (conflicts!).
+  -- Moved to Y button. Keyboard R stays.
+  local gp = getXBox360ControllerState(0)
+  local snapHeld = isKeyPressed(VK.R) or (gp and gp.GAMEPAD_Y)
+  if snapHeld then
+    if not _G['INSIDE_CAM_RELEASED'] then
+      releaseNOPs()
+      -- temp full-speed if game is slow-paused (< 0.1) so R-snap actually tracks Boy
+      local getTS = _G['INSIDE_CAM_GETTS']
+      local setTS = _G['INSIDE_CAM_SETTS']
+      if getTS and setTS and getTS ~= 0 and setTS ~= 0 then
+        local cur = mono_invoke_method(nil, getTS, nil, {})
+        if cur and cur < 0.1 then
+          _G['INSIDE_CAM_SNAP_TSWAS'] = cur
+          mono_invoke_method(nil, setTS, nil, {1.0})
+        end
+      end
+    end
+  else
+    if _G['INSIDE_CAM_RELEASED'] then
+      -- restore paused time if we kicked it up to 1.0 for R-snap
+      local was = _G['INSIDE_CAM_SNAP_TSWAS']
+      local setTS = _G['INSIDE_CAM_SETTS']
+      if was and setTS and setTS ~= 0 then
+        pcall(mono_invoke_method, nil, setTS, nil, {was})
+      end
+      _G['INSIDE_CAM_SNAP_TSWAS'] = nil
+      reapplyNOPs()
+    end
+  end
+
+  local cam = resolveCamStruct()
+  if not cam or cam == 0 then
+    -- Level transition / loading / cutscene: pointer chain broken.
+    -- AUTO-RELEASE NOPs so the game can freely stream the new level and
+    -- position its camera near Boy. Without this, the old camera coords
+    -- freeze world streaming and Boy falls through unloaded geometry.
+    if not _G['INSIDE_CAM_RELEASED'] then
+      releaseNOPs()
+      _G['INSIDE_CAM_AUTO_RELEASED'] = true
+      print('[FreeCam] level transition — NOPs auto-released for streaming')
+    end
+    local t = nowMs()
+    if t - lastDiagMs > 2000 then
+      lastDiagMs = t
+      print('[FreeCam] cam struct unresolved — waiting for new level')
+    end
+    return
+  end
+
+  -- Just came back to a valid cam after transition? Give game ~1.5s to
+  -- position camera, stream the area, then re-apply NOPs at new location.
+  if _G['INSIDE_CAM_AUTO_RELEASED'] then
+    local settleUntil = _G['INSIDE_CAM_SETTLE_UNTIL']
+    if not settleUntil then
+      _G['INSIDE_CAM_SETTLE_UNTIL'] = nowMs() + 1500
+      print('[FreeCam] new level loaded — settling camera for 1.5s...')
+      return
+    end
+    if nowMs() < settleUntil then
+      return  -- let game control camera during settle
+    end
+    -- Settled: re-apply NOPs at new position (game placed camera correctly).
+    -- IMPORTANT: re-resolve Camera.main.transform since new level may have a
+    -- different Camera instance. Stale pointer → crash on next Mono invoke.
+    local ok_tr, err_tr = pcall(function()
+      local cameraClass = mono_findClass('UnityEngine', 'Camera')
+      local compClass   = mono_findClass('UnityEngine', 'Component')
+      if cameraClass and compClass then
+        local getMain  = mono_class_findMethod(cameraClass, 'get_main')
+        local getTrans = mono_class_findMethod(compClass,   'get_transform')
+        if getMain and getTrans then
+          local mainCam = mono_invoke_method(nil, getMain, nil, {})
+          if mainCam and mainCam ~= 0 then
+            local tr = mono_invoke_method(nil, getTrans, mainCam, {})
+            if tr and tr ~= 0 then
+              _G['INSIDE_MAIN_TRANSFORM_CACHED'] = tr
+              print(string.format('[FreeCam] transform re-resolved after level transition → 0x%X', tr))
+            end
+          end
+        end
+      end
+    end)
+    if not ok_tr then
+      print('[FreeCam] transform re-resolve failed: ' .. tostring(err_tr))
+      -- Clear cache so next Mono invokes hit the safe fallback paths
+      _G['INSIDE_MAIN_TRANSFORM_CACHED'] = nil
+    end
+    reapplyNOPs()
+    _G['INSIDE_CAM_AUTO_RELEASED'] = nil
+    _G['INSIDE_CAM_SETTLE_UNTIL'] = nil
+    print('[FreeCam] NOPs re-applied at new level position')
+  end
+
+  if snapHeld then return end  -- game writes its own values while R/A held
+
+  -- Speed modifiers: Shift = 3x, Ctrl = 5x, Shift+Ctrl = 15x (turbo for level-wide travel)
+  local fast = 1
+  if isKeyPressed(VK.SHIFT) then fast = fast * 3 end
+  if isKeyPressed(VK.CTRL)  then fast = fast * 5 end
+  local p = PAN * fast
+  local z = ZOOM * fast
+
+  -- Mouse look (RMB hold) — yaw/pitch via writeFloat
+  local mx, my = getMousePos()
+  if isKeyPressed(VK_RBUTTON) then
+    local dx = mx - prevMX
+    local dy = my - prevMY
+    if math.abs(dx) <= MOUSE_MAX_DELTA and math.abs(dy) <= MOUSE_MAX_DELTA then
+      if dx ~= 0 then writeFloat(cam+0xF0, readFloat(cam+0xF0) + dx * MOUSE_SENS * fast) end
+      if dy ~= 0 then writeFloat(cam+0xF4, readFloat(cam+0xF4) - dy * MOUSE_SENS * fast) end
+    end
+  end
+  prevMX, prevMY = mx, my
+
+  -- ===== View-relative movement delta aggregation =====
+  -- localX / localY / localZ are summed across all input sources then applied
+  -- via ONE Transform.Translate(single,single,single) call per tick (Space.Self
+  -- default → camera-local axes → WASD moves in camera view space).
+  -- Q/E + LB/RB stay on WORLD vertical (cam+0x100) because a tilted camera
+  -- shouldn't make "up/down fly" twist the direction.
+  -- Fallback (no Translate / no set_position NOP): deltas route to world-axis
+  -- cam struct writes exactly like the original behaviour.
+  local localX, localY, localZ = 0, 0, 0
+
+  -- WASD — view-relative (+Z forward, +X right)
+  if isKeyPressed(VK.W) then localZ = localZ + z end
+  if isKeyPressed(VK.S) then localZ = localZ - z end
+  if isKeyPressed(VK.D) then localX = localX + p end
+  if isKeyPressed(VK.A) then localX = localX - p end
+  -- NumPad +/- = zoom analog, treat as view-relative forward/back
+  if isKeyPressed(VK.NPPLUS)  then localZ = localZ + z end
+  if isKeyPressed(VK.NPMINUS) then localZ = localZ - z end
+  -- Q/E — vertical via localY (routed through Translate). Since D-Pad yaw-only
+  -- never tilts the camera, local up == world up, so Translate Space.Self works.
+  if isKeyPressed(VK.E) then localY = localY + p end
+  if isKeyPressed(VK.Q) then localY = localY - p end
+
+  -- Arrow keys: rotation (yaw/pitch) — alternative to mouse look, no RMB needed.
+  -- Convention matches right stick: UP key = look up (pitch+), DOWN = look down.
+  local kr = KEY_ROT * fast
+  if isKeyPressed(VK.LEFT)  then writeFloat(cam+0xF0, readFloat(cam+0xF0) - kr) end
+  if isKeyPressed(VK.RIGHT) then writeFloat(cam+0xF0, readFloat(cam+0xF0) + kr) end
+  if isKeyPressed(VK.UP)    then writeFloat(cam+0xF4, readFloat(cam+0xF4) + kr) end
+  if isKeyPressed(VK.DOWN)  then writeFloat(cam+0xF4, readFloat(cam+0xF4) - kr) end
+
+  -- Gamepad: world-axis movement + D-Pad true rotation
+  if gp then
+    local SDZ, TDZ = 8000, 30
+    local function snorm(v)
+      v = v or 0
+      if math.abs(v) < SDZ then return 0 end
+      local sign = (v < 0) and -1 or 1
+      local n = (math.abs(v) - SDZ) / (32767 - SDZ)
+      if n > 1 then n = 1 end
+      return sign * n * n                              -- squared for smoothness
+    end
+    local rx = snorm(gp.ThumbRightX)
+    local ry = snorm(gp.ThumbRightY)
+    local lx = snorm(gp.ThumbLeftX)
+    local ly = snorm(gp.ThumbLeftY)
+    local LT_raw = gp.LeftTrigger or 0
+    local RT_raw = gp.RightTrigger or 0
+    local lt = (LT_raw > TDZ) and (LT_raw / 255.0) or 0
+    local rt = (RT_raw > TDZ) and (RT_raw / 255.0) or 0
+
+    local gpRot  = GP_ROT  * fast
+    local gpPan  = GP_PAN  * fast
+    local gpZoom = GP_ZOOM * fast
+
+    -- Right stick: X = strafe (localX), Y = vertical (localY)
+    -- All routed through Translate aggregate for view-relative movement.
+    if rx ~= 0 then localX = localX + rx * gpPan end
+    if ry ~= 0 then localY = localY + ry * gpPan end
+    -- Left stick: NOT TOUCHED — reserved for Boy's movement.
+    -- Triggers = view-relative forward/back (LT=back, RT=forward)
+    if lt > 0 then localZ = localZ - lt * gpZoom end
+    if rt > 0 then localZ = localZ + rt * gpZoom end
+    -- LB (FreeCam toggle) and RB (Pause toggle) are handled by a separate
+    -- always-active entry ("Gamepad Toggle Listener") so they work even when
+    -- FreeCam is OFF — giving both keys gamepad parity with F1/tilde.
+
+    -- D-Pad: L/R = yaw rotation (no tilt), U/D = vertical fly
+    local dpRot = GP_DPAD_ROT * fast
+    local dYaw = 0
+    if gp.GAMEPAD_DPAD_LEFT  then dYaw = dYaw - dpRot end
+    if gp.GAMEPAD_DPAD_RIGHT then dYaw = dYaw + dpRot end
+    -- D-Pad U/D = fly up/down (world vertical via localY, through Translate)
+    if gp.GAMEPAD_DPAD_UP    then localY = localY + gpPan end
+    if gp.GAMEPAD_DPAD_DOWN  then localY = localY - gpPan end
+
+    if dYaw ~= 0 then
+      local rot3F = _G['INSIDE_ROTATE_3F']
+      local tr    = _G['INSIDE_MAIN_TRANSFORM_CACHED']
+      local used  = false
+      if rot3F and tr and _G['INSIDE_MOVECAM_NOP_ADDR'] then
+        local ok = pcall(mono_invoke_method, nil, rot3F, tr, {0.0, dYaw, 0.0})
+        if ok then used = true end
+      end
+      if not used then
+        writeFloat(cam+0xF0, readFloat(cam+0xF0) + dYaw)
+      end
+    end
+  end
+
+  -- ===== Apply aggregated view-relative movement via Transform.Translate =====
+  -- ONE Mono invoke per tick regardless of how many inputs pushed deltas.
+  -- Fallback: world-axis cam struct writes matching pre-hack behaviour.
+  if localX ~= 0 or localY ~= 0 or localZ ~= 0 then
+    local trans3F = _G['INSIDE_TRANSLATE_3F']
+    local tr      = _G['INSIDE_MAIN_TRANSFORM_CACHED']
+    local used    = false
+    if trans3F and tr and _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR'] then
+      local ok = pcall(mono_invoke_method, nil, trans3F, tr, {localX, localY, localZ})
+      if ok then used = true end
+    end
+    if not used then
+      -- Fallback to original world-axis semantics:
+      --   localZ → cam+F8 (depth / zoom axis), localX → cam+FC (lateral),
+      --   localY → cam+100 (rare — only hit if future code writes localY).
+      if localZ ~= 0 then writeFloat(cam+0xF8,  readFloat(cam+0xF8)  + localZ) end
+      if localX ~= 0 then writeFloat(cam+0xFC,  readFloat(cam+0xFC)  + localX) end
+      if localY ~= 0 then writeFloat(cam+0x100, readFloat(cam+0x100) + localY) end
+    end
+  end
+end
+
+local t = createTimer(getMainForm())
+t.Interval = 16
+t.OnTimer = tick
+_G['INSIDE_CAM_TIMER'] = t
+
+print('')
+print('=== FreeCam ACTIVE (free flight via cam world coords) ===')
+print('')
+print('SPEED MODIFIERS:')
+print('  Shift        = 3x speed')
+print('  Ctrl         = 5x speed (for big-level travel)')
+print('  Shift + Ctrl = 15x speed (fastest)')
+print('')
+print('Keyboard + Mouse:')
+print('  HOLD RMB + mouse = aim-pan (2D)')
+print('  Arrow keys       = aim-pan (2D)')
+print('  W / S            = forward / back (view-relative)')
+print('  A / D            = strafe left / right (view-relative)')
+print('  Q / E            = fly down / up (WORLD vertical)')
+print('  HOLD R           = track Boy (release → freeze at new pos)')
+print('')
+print('Gamepad:')
+print('  Left Stick       = Boy movement (NOT touched by FreeCam)')
+print('  Right Stick X    = strafe left/right (view-relative)')
+print('  Right Stick Y    = fly down/up')
+print('  D-Pad L / R      = TRUE 360° yaw rotation (NO head tilt)')
+print('  D-Pad U / D      = fly up / down')
+print('  LT / RT          = back / forward (view-relative)')
+print('  LB               = toggle FreeCam (same as F1)')
+print('  RB               = toggle slow-mo pause (same as tilde)')
+print('  HOLD Y           = track Boy')
+print('')
+print('F1 = toggle FreeCam on/off,  ` (tilde) = near-pause game')
+print('')
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+
+-- 1. Stop timer FIRST so no more tick() writes happen mid-disable
+local t = _G['INSIDE_CAM_TIMER']
+if t then pcall(function() t.destroy() end); _G['INSIDE_CAM_TIMER'] = nil end
+
+-- 2. Restore original bytes at each NOP site (idempotent — safe even if hold-to-track left them released)
+local sites = _G['INSIDE_CAM_NOP_SITES']
+if sites then
+  for _, site in ipairs(sites) do
+    if site.addr and site.addr ~= 0 then
+      local ok, err = pcall(function() writeBytes(site.addr, site.orig) end)
+      if not ok then
+        print(string.format('[FreeCam] restore %s failed: %s', site.name or '?', tostring(err)))
+      end
+    end
+  end
+end
+
+-- 3. Restore paused time if R-snap left it unpaused (safety net; tick() should have done this already)
+local was  = _G['INSIDE_CAM_SNAP_TSWAS']
+local setTS = _G['INSIDE_CAM_SETTS']
+if was == 0 and setTS and setTS ~= 0 then
+  pcall(mono_invoke_method, nil, setTS, nil, {0.0})
+end
+
+
+-- 3c. Restore MoveCamera set_rotation call (NOP reversal). Runs BEFORE cleanup
+--     so the game regains control of camera orientation even if some step below
+--     fails. pcall so a bad addr can't block the rest of DISABLE.
+do
+  local nopAddr = _G['INSIDE_MOVECAM_NOP_ADDR']
+  local nopOrig = _G['INSIDE_MOVECAM_NOP_ORIG']
+  if nopAddr and nopOrig then
+    local ok, err = pcall(writeBytes, nopAddr, nopOrig)
+    if ok then
+      print(string.format('[FreeCam] restored MoveCamera set_rotation @ 0x%X (%d bytes)',
+        nopAddr, _G['INSIDE_MOVECAM_NOP_SIZE'] or #nopOrig))
+    else
+      print('[FreeCam] NOP restore FAILED: ' .. tostring(err))
+    end
+  end
+end
+
+-- 3d. Restore MoveCamera set_position call (NOP reversal). Without this,
+--     turning FreeCam off and on again would leave camera position frozen
+--     because game's own set_position would still be NOPed.
+do
+  local spAddr = _G['INSIDE_MOVECAM_SETPOS_NOP_ADDR']
+  local spOrig = _G['INSIDE_MOVECAM_SETPOS_NOP_ORIG']
+  if spAddr and spOrig then
+    local ok, err = pcall(writeBytes, spAddr, spOrig)
+    if ok then
+      print(string.format('[FreeCam] restored MoveCamera set_position @ 0x%X (%d bytes)',
+        spAddr, _G['INSIDE_MOVECAM_SETPOS_NOP_SIZE'] or #spOrig))
+    else
+      print('[FreeCam] set_position NOP restore FAILED: ' .. tostring(err))
+    end
+  end
+end
+
+-- 4. Cleanup globals
+for _, k in ipairs({
+  'INSIDE_CAM_NOP_SITES','INSIDE_CAM_RELEASED','INSIDE_CAM_GRACE_UNTIL',
+  'INSIDE_CAM_SETTS','INSIDE_CAM_GETTS','INSIDE_CAM_SNAP_TSWAS','INSIDE_CAM_TIMER',
+  'INSIDE_CAM_AUTO_RELEASED','INSIDE_CAM_SETTLE_UNTIL','INSIDE_ORBIT_TARGET',
+  'INSIDE_FWD_LASTLOG','INSIDE_RS_LOGGED','INSIDE_DP_LOGGED','INSIDE_DP_ERR_LOGGED','INSIDE_DP_FB_LOGGED',
+  'INSIDE_MAIN_TRANSFORM_CACHED','INSIDE_TRANSFORM_ROTATE','INSIDE_TR_GET_EULER',
+  'INSIDE_MONO_ROT_LOGGED','INSIDE_MONO_ROT_FAILED',
+  -- Deep rotation hack state
+  'INSIDE_ROTATE_CANDIDATES','INSIDE_ROTATE_CHOSEN','INSIDE_ROTATE_DEAD',
+  'INSIDE_ROTATE_3F',
+  'INSIDE_MOVECAM_NOP_ADDR','INSIDE_MOVECAM_NOP_ORIG','INSIDE_MOVECAM_NOP_SIZE',
+  -- Deep translate hack state
+  'INSIDE_TRANSLATE_3F',
+  'INSIDE_MOVECAM_SETPOS_NOP_ADDR','INSIDE_MOVECAM_SETPOS_NOP_ORIG','INSIDE_MOVECAM_SETPOS_NOP_SIZE',
+  -- Camera class references
+  'INSIDE_CAM_CLASS','INSIDE_CAM_GETMAIN',
+}) do _G[k] = nil end
+
+print('=== FreeCam DISABLED (original bytes restored) ===')
+]]></AssemblerScript>
+      <Hotkeys>
+        <Hotkey>
+          <Action>Toggle Activation</Action>
+          <Keys>
+            <Key>112</Key>
+          </Keys>
+          <ID>0</ID>
+          <Description>Toggle FreeCam on/off (F1)</Description>
+        </Hotkey>
+      </Hotkeys>
+    </CheatEntry>
+
+    <CheatEntry>
+      <ID>9</ID>
+      <Description>"Toggle Time Pause (toggle: `~ / RB)"</Description>
+      <LastState Activated="0"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript><![CDATA[[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Make sure Mono is injected before we try to resolve UnityEngine.Time.
+-- If the game is still loading / at main menu, this may still fail;
+-- in that case we refuse to toggle so listener won't spam Active=false.
+if not LaunchMonoDataCollector() then
+  print('[Time Pause] Mono not ready — start a level first')
+  error('Mono not ready')
+end
+local timeClass = mono_findClass('UnityEngine', 'Time')
+if not timeClass or timeClass == 0 then
+  print('[Time Pause] UnityEngine.Time not found — start a level first')
+  error('UnityEngine.Time not found')
+end
+local setTS = mono_class_findMethod(timeClass, 'set_timeScale')
+local getTS = mono_class_findMethod(timeClass, 'get_timeScale')
+local cur = mono_invoke_method(nil, getTS, nil, {})
+_G['INSIDE_PAUSE_PREV'] = cur or 1.0
+_G['INSIDE_PAUSE_SETTS'] = setTS
+-- Camera uses direct Mono Translate/Rotate (doesn't need Time.deltaTime),
+-- so we can push timeScale very near zero without freezing the camera pipeline.
+-- 0.001 = Boy 1000x slower (visually frozen) with camera fully responsive.
+mono_invoke_method(nil, setTS, nil, {0.001})
+print(string.format('Time SLOW-PAUSED (was %s, now 0.001 — Boy visually frozen, camera full control)', tostring(cur)))
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local setTS = _G['INSIDE_PAUSE_SETTS']
+local prev = _G['INSIDE_PAUSE_PREV'] or 1.0
+if setTS and setTS ~= 0 then
+  pcall(mono_invoke_method, nil, setTS, nil, {prev})
+end
+_G['INSIDE_PAUSE_SETTS'] = nil
+_G['INSIDE_PAUSE_PREV'] = nil
+print(string.format('Time RESUMED (%s)', tostring(prev)))
+]]></AssemblerScript>
+      <Hotkeys>
+        <Hotkey>
+          <Action>Toggle Activation</Action>
+          <Keys>
+            <Key>192</Key>
+          </Keys>
+          <ID>0</ID>
+        </Hotkey>
+      </Hotkeys>
+    </CheatEntry>
+
+    <CheatEntry>
+      <ID>12</ID>
+      <Description>"Gamepad toggle listener: LB=FreeCam, RB=Pause (keep enabled)"</Description>
+      <LastState Activated="1"/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript><![CDATA[[ENABLE]
+{$lua}
+if syntaxcheck then return end
+
+-- Always-active background poller: edge-triggers LB and RB to toggle the
+-- FreeCam and Time Pause entries respectively. Works independently of
+-- FreeCam being active, giving full gamepad parity with F1 / tilde keys.
+local t = createTimer(getMainForm())
+t.Interval = 50
+t.OnTimer = function()
+  local gp = getXBox360ControllerState(0)
+  if not gp then return end
+
+  -- LB = toggle FreeCam entry
+  local lb = gp.GAMEPAD_LEFT_SHOULDER
+  if lb and not _G['INSIDE_LBGLOBAL_PREV'] then
+    pcall(function()
+      local al = getAddressList()
+      if al then
+        local mr = al.getMemoryRecordByDescription('ENABLE FreeCam (toggle: F1 / LB)')
+        if mr then
+          mr.Active = not mr.Active
+          print(string.format('[LB] FreeCam toggled -> %s', tostring(mr.Active)))
+        end
+      end
+    end)
+  end
+  _G['INSIDE_LBGLOBAL_PREV'] = lb
+
+  -- RB = toggle Time Pause entry
+  local rb = gp.GAMEPAD_RIGHT_SHOULDER
+  if rb and not _G['INSIDE_RBGLOBAL_PREV'] then
+    pcall(function()
+      local al = getAddressList()
+      if al then
+        local mr = al.getMemoryRecordByDescription('Toggle Time Pause (toggle: `~ / RB)')
+        if mr then
+          mr.Active = not mr.Active
+          print(string.format('[RB] Time Pause toggled -> %s', tostring(mr.Active)))
+        end
+      end
+    end)
+  end
+  _G['INSIDE_RBGLOBAL_PREV'] = rb
+end
+_G['INSIDE_GPLISTEN_TIMER'] = t
+print('[Gamepad Listener] running (LB=FreeCam, RB=Pause)')
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local t = _G['INSIDE_GPLISTEN_TIMER']
+if t then pcall(function() t.destroy() end); _G['INSIDE_GPLISTEN_TIMER'] = nil end
+_G['INSIDE_LBGLOBAL_PREV'] = nil
+_G['INSIDE_RBGLOBAL_PREV'] = nil
+print('[Gamepad Listener] stopped')
+]]></AssemblerScript>
+    </CheatEntry>
+
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
