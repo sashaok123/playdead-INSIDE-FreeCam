@@ -51,7 +51,7 @@ Boy's own controls are not touched. You still play the game normally while you m
 | Right Stick X | Strafe camera left / right |
 | Right Stick Y | Fly camera down / up |
 | D-Pad Left / Right | Rotate camera (full 360 degrees, no tilt) |
-| D-Pad Up / Down | Fly up / down |
+| D-Pad Up / Down | Tilt camera up / down (clamped to +/- 30 degrees from start) |
 | LT / RT | Move camera back / forward |
 | LB | Toggle FreeCam on / off (same as F1) |
 | RB | Toggle slow-motion (same as tilde) |
@@ -109,6 +109,7 @@ playdead-INSIDE-FreeCam/
   README.md                       this file
   architecture.md                 technical deep dive into the patches and runtime state
   RELEASE_NOTES_v1.0.0.md         notes for v1.0.0
+  RELEASE_NOTES_v1.1.0.md         notes for v1.1.0
   LICENSE                         public domain (Unlicense)
   inside_header.jpg               store page header used at the top of this README
   .gitignore
@@ -227,7 +228,7 @@ All state kept in the global Lua table `_G` (Cheat Engine's Lua state persists a
 ### Known limitations
 
 - **Camera-relative Boy controls** (stick forward = Boy runs into the screen when camera is rotated 90 degrees) is not in this release. The research and design are complete (see the "Deferred work" section in architecture.md). It needs an AA trampoline hook into `GameInput.Core.UpdateCommand`, roughly 4 to 5 hours of careful low-level work.
-- **Rotation is yaw-only** by design. D-Pad up/down moves the camera vertically instead of pitching. Keeps the horizon level and makes the camera much easier to use in a 2.5D game.
+- **Pitch is clamped to +/- 30 degrees** from the FreeCam start position. Yaw is unrestricted (full 360 degrees). The clamp keeps the horizon controllable and prevents accidental flips. Yaw uses Unity's world-Y axis (not local-Y) so combined yaw + pitch never tilts the horizon (no roll).
 - **Aim-pan inputs** (mouse RMB, arrow keys) still write to the legacy `cam+0xF0` / `+0xF4` fields but have no visible effect once `set_rotation` is NOPed. Kept for legacy compat, can be removed.
 - **Game scripts that swap cameras** (cinematic sequences, some puzzle rooms) may temporarily override the FreeCam. Expected; toggle FreeCam off for those sequences.
 - **Fast level transitions** can leave the cached Transform pointer stale for one frame. The table detects this and re-resolves, but you may see a single-frame teleport in rare cases.

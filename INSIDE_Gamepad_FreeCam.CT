@@ -32,6 +32,15 @@ end) then end
       <AssemblerScript><![CDATA[[ENABLE]
 {$lua}
 if syntaxcheck then return end
+-- Hide CE Lua engine so its window doesn't pop to foreground on print().
+-- Console logs still go there, just the window stays minimised/hidden.
+pcall(function()
+  if type(getLuaEngine) == 'function' then
+    local le = getLuaEngine()
+    if le and le.hide then le.hide() end
+  end
+end)
+
 print('=== INSIDE FreeCam: enabling (orbit-style, NOP game writes) ===')
 
 if not LaunchMonoDataCollector() then
@@ -144,12 +153,25 @@ local function resolveCamStruct()
   return p
 end
 
--- 4. Cache UnityEngine.Time methods — ONLY for R-press unpause, NEVER called in tick
+-- 4. Cache UnityEngine.Time methods — ONLY for R-press unpause, NEVER called in tick.
+--    Also force timeScale back to 1.0 on enable so a stuck slow-mo from a
+--    previous session can't make Boy unresponsive to the left stick.
 do
   local timeClass = mono_findClass('UnityEngine', 'Time')
   if timeClass and timeClass ~= 0 then
-    _G['INSIDE_CAM_SETTS'] = mono_class_findMethod(timeClass, 'set_timeScale')
-    _G['INSIDE_CAM_GETTS'] = mono_class_findMethod(timeClass, 'get_timeScale')
+    local setTS = mono_class_findMethod(timeClass, 'set_timeScale')
+    local getTS = mono_class_findMethod(timeClass, 'get_timeScale')
+    _G['INSIDE_CAM_SETTS'] = setTS
+    _G['INSIDE_CAM_GETTS'] = getTS
+    if setTS and setTS ~= 0 then
+      pcall(function()
+        local cur = getTS and mono_invoke_method(nil, getTS, nil, {})
+        if cur and cur < 0.5 then
+          mono_invoke_method(nil, setTS, nil, {1.0})
+          print(string.format('  [TIME] forced timeScale 1.0 (was %s — stuck slow-mo cleared)', tostring(cur)))
+        end
+      end)
+    end
   end
 end
 
@@ -209,23 +231,28 @@ do
       return
     end
 
-    -- A) Enumerate all Rotate overloads + auto-pick single,single,single
+    -- A) Enumerate Rotate overloads, capture both 3-float and 4-arg-with-Space.
+    --    Filter is EXACT match on signature string so we don't accidentally pick
+    --    Vector3-axis overload (which would crash if invoked with float args).
     print('--- Transform.Rotate overloads ---')
     local ok, methods = pcall(mono_class_enumMethods, tClass)
-    local rotate3F = nil  -- will hold addr of Rotate(single,single,single)
+    local rotate3F = nil
+    local rotate4F = nil  -- Rotate(float, float, float, Space) - exact sig only
     if ok and type(methods) == 'table' then
       print(string.format('  enumMethods returned %d methods total', #methods))
       for _, m in ipairs(methods) do
         local mname = m.name or m.methodname or m.Name
         local maddr = m.method or m.address or m.Method or m.Address
         if mname == 'Rotate' and maddr and maddr ~= 0 then
-          -- Get signature via confirmed working API
           local ok_s, sig = pcall(mono_method_getSignature, maddr)
           if ok_s and type(sig) == 'string' then
             print(string.format('  Rotate 0x%X  sig=(%s)', maddr, sig))
             if sig == 'single,single,single' then
               rotate3F = maddr
-              print(string.format('    ^^^ TARGET: 3-float overload = 0x%X', maddr))
+              print(string.format('    ^^^ TARGET 3-float = 0x%X', maddr))
+            elseif sig == 'single,single,single,UnityEngine.Space' then
+              rotate4F = maddr
+              print(string.format('    ^^^ TARGET 4-arg (UnityEngine.Space) = 0x%X', maddr))
             end
           else
             print(string.format('  Rotate 0x%X  (no signature available)', maddr))
@@ -234,8 +261,12 @@ do
       end
     end
     _G['INSIDE_ROTATE_3F'] = rotate3F
+    _G['INSIDE_ROTATE_4F'] = rotate4F
     if not rotate3F then
       print('  [WARN] Rotate(single,single,single) not found — D-Pad will stay in fallback')
+    end
+    if not rotate4F then
+      print('  [WARN] Rotate(...,UnityEngine.Space) not found — yaw will roll on combined input')
     end
 
     -- B) Resolve set_rotation (MonoMethod + JIT)
@@ -651,6 +682,8 @@ local function tick()
     reapplyNOPs()
     _G['INSIDE_CAM_AUTO_RELEASED'] = nil
     _G['INSIDE_CAM_SETTLE_UNTIL'] = nil
+    -- Reset D-Pad pitch accumulator so new level starts with fresh +/-30 deg range
+    _G['INSIDE_PITCH_ACCUM'] = nil
     print('[FreeCam] NOPs re-applied at new level position')
   end
 
@@ -719,8 +752,9 @@ local function tick()
     end
     local rx = snorm(gp.ThumbRightX)
     local ry = snorm(gp.ThumbRightY)
-    local lx = snorm(gp.ThumbLeftX)
-    local ly = snorm(gp.ThumbLeftY)
+    -- Left stick is intentionally NOT polled here — it is reserved for Boy's
+    -- movement and reading it via getXBox360ControllerState can in some setups
+    -- interfere with the game's own XInput query path.
     local LT_raw = gp.LeftTrigger or 0
     local RT_raw = gp.RightTrigger or 0
     local lt = (LT_raw > TDZ) and (LT_raw / 255.0) or 0
@@ -742,25 +776,66 @@ local function tick()
     -- always-active entry ("Gamepad Toggle Listener") so they work even when
     -- FreeCam is OFF — giving both keys gamepad parity with F1/tilde.
 
-    -- D-Pad: L/R = yaw rotation (no tilt), U/D = vertical fly
+    -- D-Pad: L/R = yaw rotation (no tilt), U/D = pitch tilt (clamped)
     local dpRot = GP_DPAD_ROT * fast
     local dYaw = 0
     if gp.GAMEPAD_DPAD_LEFT  then dYaw = dYaw - dpRot end
     if gp.GAMEPAD_DPAD_RIGHT then dYaw = dYaw + dpRot end
-    -- D-Pad U/D = fly up/down (world vertical via localY, through Translate)
-    if gp.GAMEPAD_DPAD_UP    then localY = localY + gpPan end
-    if gp.GAMEPAD_DPAD_DOWN  then localY = localY - gpPan end
+
+    -- D-Pad U/D = camera pitch tilt via Transform.Rotate (same path as L/R yaw).
+    -- Cumulative tilt clamped to +/-30 deg from FreeCam baseline (centre).
+    -- Accumulator tracked manually since reading transform.eulerAngles via Mono
+    -- can hang on Vector3 marshalling.
+    local dPitchIn = 0
+    if gp.GAMEPAD_DPAD_UP    then dPitchIn = dPitchIn + dpRot end
+    if gp.GAMEPAD_DPAD_DOWN  then dPitchIn = dPitchIn - dpRot end
+    if dPitchIn ~= 0 then
+      local accum = _G['INSIDE_PITCH_ACCUM'] or 0  -- positive = camera tilted UP from baseline
+      local newAccum = accum + dPitchIn
+      if newAccum >  30 then newAccum =  30 end
+      if newAccum < -30 then newAccum = -30 end
+      local applyD = newAccum - accum
+      if applyD ~= 0 then
+        local rot3F = _G['INSIDE_ROTATE_3F']
+        local tr    = _G['INSIDE_MAIN_TRANSFORM_CACHED']
+        local used  = false
+        -- Use 3-arg Rotate (Space.Self default = rotate around local X axis).
+        -- Unity convention: +X rotation = pitch DOWN. Negate so positive accum = LOOK UP.
+        if rot3F and tr and _G['INSIDE_MOVECAM_NOP_ADDR'] then
+          local ok = pcall(mono_invoke_method, nil, rot3F, tr, {-applyD, 0.0, 0.0})
+          if ok then used = true end
+        end
+        if not used then
+          local before = readFloat(cam+0xF4) or 0
+          writeFloat(cam+0xF4, before + applyD)
+        end
+        _G['INSIDE_PITCH_ACCUM'] = newAccum
+      end
+    end
 
     if dYaw ~= 0 then
+      local rot4F = _G['INSIDE_ROTATE_4F']
       local rot3F = _G['INSIDE_ROTATE_3F']
       local tr    = _G['INSIDE_MAIN_TRANSFORM_CACHED']
       local used  = false
-      if rot3F and tr and _G['INSIDE_MOVECAM_NOP_ADDR'] then
+      -- Prefer 4-arg with Space.World (= 0): yaw stays in world-Y plane regardless
+      -- of pitch tilt, no roll accumulation. Mixed args: plain floats + typed
+      -- vtDword for the enum. Exact-sig match in analysis ensures we have the
+      -- right method (not Vector3-axis variant).
+      if rot4F and tr and _G['INSIDE_MOVECAM_NOP_ADDR'] then
+        local ok = pcall(mono_invoke_method, nil, rot4F, tr, {
+          0.0, dYaw, 0.0,
+          { type = vtDword, value = 0 },  -- Space.World = 0
+        })
+        if ok then used = true end
+      end
+      if not used and rot3F and tr and _G['INSIDE_MOVECAM_NOP_ADDR'] then
         local ok = pcall(mono_invoke_method, nil, rot3F, tr, {0.0, dYaw, 0.0})
         if ok then used = true end
       end
       if not used then
-        writeFloat(cam+0xF0, readFloat(cam+0xF0) + dYaw)
+        local before = readFloat(cam+0xF0) or 0
+        writeFloat(cam+0xF0, before + dYaw)
       end
     end
   end
@@ -813,7 +888,7 @@ print('  Left Stick       = Boy movement (NOT touched by FreeCam)')
 print('  Right Stick X    = strafe left/right (view-relative)')
 print('  Right Stick Y    = fly down/up')
 print('  D-Pad L / R      = TRUE 360° yaw rotation (NO head tilt)')
-print('  D-Pad U / D      = fly up / down')
+print('  D-Pad U / D      = tilt camera up / down (clamped to +/-30 deg from start)')
 print('  LT / RT          = back / forward (view-relative)')
 print('  LB               = toggle FreeCam (same as F1)')
 print('  RB               = toggle slow-mo pause (same as tilde)')
@@ -825,6 +900,14 @@ print('')
 [DISABLE]
 {$lua}
 if syntaxcheck then return end
+
+-- Hide CE Lua engine so its window doesn't pop to foreground on print().
+pcall(function()
+  if type(getLuaEngine) == 'function' then
+    local le = getLuaEngine()
+    if le and le.hide then le.hide() end
+  end
+end)
 
 -- 1. Stop timer FIRST so no more tick() writes happen mid-disable
 local t = _G['INSIDE_CAM_TIMER']
@@ -895,11 +978,13 @@ for _, k in ipairs({
   'INSIDE_MONO_ROT_LOGGED','INSIDE_MONO_ROT_FAILED',
   -- Deep rotation hack state
   'INSIDE_ROTATE_CANDIDATES','INSIDE_ROTATE_CHOSEN','INSIDE_ROTATE_DEAD',
-  'INSIDE_ROTATE_3F',
+  'INSIDE_ROTATE_3F','INSIDE_ROTATE_4F',
   'INSIDE_MOVECAM_NOP_ADDR','INSIDE_MOVECAM_NOP_ORIG','INSIDE_MOVECAM_NOP_SIZE',
   -- Deep translate hack state
   'INSIDE_TRANSLATE_3F',
   'INSIDE_MOVECAM_SETPOS_NOP_ADDR','INSIDE_MOVECAM_SETPOS_NOP_ORIG','INSIDE_MOVECAM_SETPOS_NOP_SIZE',
+  -- D-Pad pitch accumulator
+  'INSIDE_PITCH_ACCUM',
   -- Camera class references
   'INSIDE_CAM_CLASS','INSIDE_CAM_GETMAIN',
 }) do _G[k] = nil end
@@ -926,6 +1011,13 @@ print('=== FreeCam DISABLED (original bytes restored) ===')
       <AssemblerScript><![CDATA[[ENABLE]
 {$lua}
 if syntaxcheck then return end
+-- Hide CE Lua engine so its window doesn't pop to foreground on print().
+pcall(function()
+  if type(getLuaEngine) == 'function' then
+    local le = getLuaEngine()
+    if le and le.hide then le.hide() end
+  end
+end)
 -- Make sure Mono is injected before we try to resolve UnityEngine.Time.
 -- If the game is still loading / at main menu, this may still fail;
 -- in that case we refuse to toggle so listener won't spam Active=false.
@@ -941,19 +1033,41 @@ end
 local setTS = mono_class_findMethod(timeClass, 'set_timeScale')
 local getTS = mono_class_findMethod(timeClass, 'get_timeScale')
 local cur = mono_invoke_method(nil, getTS, nil, {})
-_G['INSIDE_PAUSE_PREV'] = cur or 1.0
+-- If a previous run left the game stuck slow-paused, ignore that and assume 1.0.
+-- This prevents DISABLE from "restoring" to 0.001 and leaving the player frozen.
+if not cur or cur < 0.5 then cur = 1.0 end
+_G['INSIDE_PAUSE_PREV'] = cur
 _G['INSIDE_PAUSE_SETTS'] = setTS
+-- Force timeScale to 0.001 (Boy ~1000x slower, visually frozen).
 -- Camera uses direct Mono Translate/Rotate (doesn't need Time.deltaTime),
--- so we can push timeScale very near zero without freezing the camera pipeline.
--- 0.001 = Boy 1000x slower (visually frozen) with camera fully responsive.
-mono_invoke_method(nil, setTS, nil, {0.001})
-print(string.format('Time SLOW-PAUSED (was %s, now 0.001 — Boy visually frozen, camera full control)', tostring(cur)))
+-- so the camera pipeline stays fully responsive.
+pcall(mono_invoke_method, nil, setTS, nil, {0.001})
+print(string.format('Time SLOW-PAUSED (saved prev=%s, now 0.001)', tostring(cur)))
 
 [DISABLE]
 {$lua}
 if syntaxcheck then return end
+-- Hide CE Lua engine so its window doesn't pop to foreground on print().
+pcall(function()
+  if type(getLuaEngine) == 'function' then
+    local le = getLuaEngine()
+    if le and le.hide then le.hide() end
+  end
+end)
+-- Force timeScale back to 1.0 unconditionally. Resolve setTS fresh in case the
+-- saved reference is stale (game restart, level reload, prev session leftover).
 local setTS = _G['INSIDE_PAUSE_SETTS']
+if not setTS or setTS == 0 then
+  pcall(function()
+    local timeClass = mono_findClass('UnityEngine', 'Time')
+    if timeClass and timeClass ~= 0 then
+      setTS = mono_class_findMethod(timeClass, 'set_timeScale')
+    end
+  end)
+end
 local prev = _G['INSIDE_PAUSE_PREV'] or 1.0
+-- Sanity: if saved prev is suspiciously low, force 1.0 (avoids stuck slow-mo)
+if prev < 0.5 then prev = 1.0 end
 if setTS and setTS ~= 0 then
   pcall(mono_invoke_method, nil, setTS, nil, {prev})
 end
@@ -980,6 +1094,13 @@ print(string.format('Time RESUMED (%s)', tostring(prev)))
       <AssemblerScript><![CDATA[[ENABLE]
 {$lua}
 if syntaxcheck then return end
+-- Hide CE Lua engine so its window doesn't pop to foreground on print().
+pcall(function()
+  if type(getLuaEngine) == 'function' then
+    local le = getLuaEngine()
+    if le and le.hide then le.hide() end
+  end
+end)
 
 -- Always-active background poller: edge-triggers LB and RB to toggle the
 -- FreeCam and Time Pause entries respectively. Works independently of
